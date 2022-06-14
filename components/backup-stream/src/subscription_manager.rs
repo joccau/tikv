@@ -301,9 +301,12 @@ where
                         warn!("waiting for initial scanning done timed out, forcing progress(with risk of data loss)!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let rts = self.subs.resolve_with(min_ts);
+                    let cps = self.subs.resolve_with(min_ts);
+                    // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
+                    let rts = cps.iter().map(|(_, t)| *t).min().unwrap_or(min_ts);
+
                     self.subs.warn_if_gap_too_huge(rts);
-                    callback(rts);
+                    callback(rts, cps);
                 }
             }
         }

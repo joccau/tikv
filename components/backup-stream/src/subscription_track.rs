@@ -129,15 +129,14 @@ impl SubscriptionTracer {
     }
 
     /// try advance the resolved ts with the min ts of in-memory locks.
-    pub fn resolve_with(&self, min_ts: TimeStamp) -> TimeStamp {
+    /// returns the regions and theirs resolved ts.
+    pub fn resolve_with(&self, min_ts: TimeStamp) -> Vec<(Region, TimeStamp)> {
         self.0
             .iter_mut()
             // Don't advance the checkpoint ts of removed region.
             .filter(|s| s.state != SubscriptionState::Removal)
-            .map(|mut s| s.resolver.resolve(min_ts))
-            .min()
-            // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
-            .unwrap_or(min_ts)
+            .map(|mut s| (s.meta.clone(), s.resolver.resolve(min_ts)))
+            .collect()
     }
 
     #[inline(always)]

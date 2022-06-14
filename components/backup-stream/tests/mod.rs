@@ -500,7 +500,9 @@ fn run_async_test<T>(test: impl Future<Output = T>) -> T {
 mod test {
     use std::time::Duration;
 
-    use backup_stream::{errors::Error, metadata::MetadataClient, Task};
+    use backup_stream::{
+        errors::Error, metadata::MetadataClient, RegionCheckpointOperation, RegionSet, Task,
+    };
     use tikv_util::{box_err, defer, info, HandyRwLock};
     use txn_types::TimeStamp;
 
@@ -679,5 +681,35 @@ mod test {
         .unwrap();
         // The checkpoint should be advanced as expection when the inflight message has been consumed.
         assert!(checkpoint > 512, "checkpoint = {}", checkpoint);
+    }
+
+    #[test]
+    fn region_checkpoint_info() {
+        let mut suite = super::Suite::new("checkpoint_info", 1);
+        suite.must_register_task(1, "checkpoint_info");
+        suite.must_split(&make_split_key_at_record(1, 42));
+        run_async_test(suite.write_records(0, 128, 1));
+        suite.force_flush_files("checkpoint_info");
+        suite.wait_for_flush();
+        std::thread::sleep(Duration::from_secs(1));
+        let (tx, rx) = std::sync::mpsc::channel();
+        suite.run(|| {
+            let tx = tx.clone();
+            Task::RegionCheckpointsOp(RegionCheckpointOperation::Get(
+                RegionSet::Universal,
+                Box::new(move |rs| {
+                    tx.send(rs).unwrap();
+                }),
+            ))
+        });
+        let checkpoints = rx.recv().unwrap();
+        assert!(!checkpoints.is_empty(), "{:?}", checkpoints);
+        assert!(
+            checkpoints
+                .iter()
+                .all(|cp| assert_matches!(cp, GetCheckpointResult::Ok { checkpoint, .. } if checkpoint > TimeStamp::new(256))),
+            "{:?}",
+            checkpoints
+        );
     }
 }

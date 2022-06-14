@@ -1,6 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    collections::HashSet,
     fmt,
     marker::PhantomData,
     path::PathBuf,
@@ -41,6 +42,7 @@ use txn_types::TimeStamp;
 
 use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
+    checkpoint_manager::{CheckpointManager, GetCheckpointResult, VersionedRegionId},
     errors::{ContextualResultExt, Error, Result},
     event_loader::{InitialDataLoader, PendingMemoryQuota},
     future,
@@ -73,6 +75,7 @@ pub struct Endpoint<S, R, E, RT, PDC> {
     region_operator: RegionSubscriptionManager<S, R, PDC>,
     failover_time: Option<Instant>,
     config: BackupStreamConfig,
+    checkpoint_mgr: CheckpointManager,
 }
 
 impl<S, R, E, RT, PDC> Endpoint<S, R, E, RT, PDC>
@@ -156,6 +159,7 @@ where
             region_operator,
             failover_time: None,
             config,
+            checkpoint_mgr: Default::default(),
         }
     }
 }
@@ -658,13 +662,13 @@ where
         }
     }
 
-    fn get_resolved_ts(&self, min_ts: TimeStamp) -> future![TimeStamp] {
+    fn get_resolved_ts(&self, min_ts: TimeStamp) -> future![(TimeStamp, Vec<(Region, TimeStamp)>)] {
         let (tx, rx) = oneshot::channel();
         let op = self.region_operator.clone();
         async move {
             let req = ObserveOp::ResolveRegions {
-                callback: Box::new(move |ts| {
-                    let _ = tx.send(ts);
+                callback: Box::new(move |ts, cps| {
+                    let _ = tx.send((ts, cps));
                 }),
                 min_ts,
             };
@@ -681,8 +685,9 @@ where
         let get_rts = self.get_resolved_ts(min_ts);
         let store_id = self.store_id;
         let can_advance = self.make_flush_guard();
+        let sched = self.scheduler.clone();
         async move {
-            let new_rts = get_rts.await;
+            let (new_rts, cps) = get_rts.await;
             #[cfg(feature = "failpoints")]
             fail::fail_point!("delay_on_flush");
             let fresh_regions = resolvers.collect_fresh_subs();
@@ -700,6 +705,8 @@ where
                     // We cannot advance the resolved ts for now.
                     return Ok(());
                 }
+                let t = Task::RegionCheckpointsOp(RegionCheckpointOperation::Update(cps));
+                try_send!(sched, t);
                 if !can_advance() {
                     let cp_now =
                         meta_cli
@@ -818,6 +825,38 @@ where
             }
             Task::MarkFailover(t) => self.failover_time = Some(t),
             Task::FlushWithMinTs(task, min_ts) => self.on_flush_with_min_ts(task, min_ts),
+            Task::RegionCheckpointsOp(s) => self.handle_region_checkpoints_op(s),
+        }
+    }
+
+    pub fn handle_region_checkpoints_op(&mut self, op: RegionCheckpointOperation) {
+        match op {
+            RegionCheckpointOperation::Update(u) => {
+                // Let's clear all stale checkpoints first.
+                // Or they may slow down the global checkpoint.
+                self.checkpoint_mgr.clear();
+                for (region, checkpoint) in u {
+                    self.checkpoint_mgr
+                        .update_region_checkpoint(&region, checkpoint)
+                }
+            }
+            RegionCheckpointOperation::Get(g, cb) => match g {
+                RegionSet::Universal => cb(self
+                    .checkpoint_mgr
+                    .get_all()
+                    .into_iter()
+                    .map(|c| GetCheckpointResult::ok(c.region.clone(), c.checkpoint))
+                    .collect()),
+                RegionSet::Regions(rs) => cb(rs
+                    .iter()
+                    .map(|(id, version)| {
+                        self.checkpoint_mgr.get_from_region(VersionedRegionId {
+                            region_id: *id,
+                            region_epoch_version: *version,
+                        })
+                    })
+                    .collect()),
+            },
         }
     }
 
@@ -851,6 +890,28 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
         .build()
 }
 
+#[derive(Debug)]
+pub enum RegionSet {
+    /// The universal set.
+    Universal,
+    /// A subset.
+    Regions(HashSet<(u64, u64)>),
+}
+
+pub enum RegionCheckpointOperation {
+    Update(Vec<(Region, TimeStamp)>),
+    Get(RegionSet, Box<dyn FnOnce(Vec<GetCheckpointResult>) + Send>),
+}
+
+impl fmt::Debug for RegionCheckpointOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update(arg0) => f.debug_tuple("Update").field(arg0).finish(),
+            Self::Get(arg0, _) => f.debug_tuple("Get").field(arg0).finish(),
+        }
+    }
+}
+
 pub enum Task {
     WatchTask(TaskOp),
     BatchEvent(Vec<CmdBatch>),
@@ -880,6 +941,8 @@ pub enum Task {
     /// Execute the flush with the calculated `min_ts`.
     /// This is an internal command only issued by the `Flush` task.
     FlushWithMinTs(String, TimeStamp),
+    /// The command for getting region checkpoints.
+    RegionCheckpointsOp(RegionCheckpointOperation),
 }
 
 #[derive(Debug)]
@@ -913,7 +976,7 @@ pub enum ObserveOp {
         err: Box<Error>,
     },
     ResolveRegions {
-        callback: Box<dyn FnOnce(TimeStamp) + 'static + Send>,
+        callback: Box<dyn FnOnce(TimeStamp, Vec<(Region, TimeStamp)>) + 'static + Send>,
         min_ts: TimeStamp,
     },
 }
@@ -971,6 +1034,7 @@ impl fmt::Debug for Task {
                 .field(arg0)
                 .field(arg1)
                 .finish(),
+            Self::RegionCheckpointsOp(s) => f.debug_tuple("GetRegionCheckpoints").field(s).finish(),
         }
     }
 }
@@ -1006,6 +1070,7 @@ impl Task {
             Task::Sync(..) => "sync",
             Task::MarkFailover(_) => "mark_failover",
             Task::FlushWithMinTs(..) => "flush_with_min_ts",
+            Task::RegionCheckpointsOp(..) => "get_checkpoints",
         }
     }
 }
