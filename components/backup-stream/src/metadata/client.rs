@@ -749,7 +749,7 @@ mod test {
                     MetaKey::next_bakcup_ts_of_region("test", &r)
                 }
                 CheckpointProvider::Store(id) => MetaKey::next_backup_ts_of("test", id),
-                Task => unreachable!(),
+                _ => unreachable!(),
             };
             let checkpoint = c.checkpoint;
             let cp_bytes = checkpoint.to_be_bytes();

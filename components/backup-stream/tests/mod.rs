@@ -123,7 +123,7 @@ impl Suite {
         worker
     }
 
-    fn start_endpoint(&mut self, id: u64) {
+    fn start_endpoint(&mut self, id: u64, use_v3: bool) {
         let cluster = &mut self.cluster;
         let worker = self.endpoints.get_mut(&id).unwrap();
         let sim = cluster.sim.wl();
@@ -132,6 +132,7 @@ impl Suite {
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let mut cfg = BackupStreamConfig::default();
         cfg.enable = true;
+        cfg.use_checkpoint_v3 = use_v3;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
         let ob = self.obs.get(&id).unwrap().clone();
         let endpoint = Endpoint::new(
@@ -148,7 +149,7 @@ impl Suite {
         worker.start(endpoint);
     }
 
-    pub fn new(case: &str, n: usize) -> Self {
+    pub fn new(case: &str, n: usize, use_v3: bool) -> Self {
         info!("start test"; "case" => %case, "nodes" => %n);
         let cluster = new_server_cluster(42, n);
         let mut suite = Self {
@@ -169,7 +170,7 @@ impl Suite {
         }
         suite.cluster.run();
         for id in 1..=(n as u64) {
-            suite.start_endpoint(id);
+            suite.start_endpoint(id, use_v3);
         }
         // TODO: The current mock metastore (slash_etc) doesn't supports multi-version.
         //       We must wait until the endpoints get ready to watching the metastore, or some modifies may be lost.
@@ -501,7 +502,8 @@ mod test {
     use std::time::Duration;
 
     use backup_stream::{
-        errors::Error, metadata::MetadataClient, RegionCheckpointOperation, RegionSet, Task,
+        errors::Error, metadata::MetadataClient, GetCheckpointResult, RegionCheckpointOperation,
+        RegionSet, Task,
     };
     use tikv_util::{box_err, defer, info, HandyRwLock};
     use txn_types::TimeStamp;
@@ -510,7 +512,7 @@ mod test {
 
     #[test]
     fn basic() {
-        let mut suite = super::Suite::new("basic", 4);
+        let mut suite = super::Suite::new("basic", 4, false);
 
         run_async_test(async {
             // write data before the task starting, for testing incremental scanning.
@@ -530,7 +532,7 @@ mod test {
 
     #[test]
     fn with_split() {
-        let mut suite = super::Suite::new("with_split", 4);
+        let mut suite = super::Suite::new("with_split", 4, false);
         run_async_test(async {
             let round1 = suite.write_records(0, 128, 1).await;
             suite.must_split(&make_split_key_at_record(1, 42));
@@ -549,7 +551,7 @@ mod test {
     #[test]
     /// This case tests whether the backup can continue when the leader failes.
     fn leader_down() {
-        let mut suite = super::Suite::new("leader_down", 4);
+        let mut suite = super::Suite::new("leader_down", 4, false);
         suite.must_register_task(1, "test_leader_down");
         suite.sync();
         let round1 = run_async_test(suite.write_records(0, 128, 1));
@@ -569,7 +571,7 @@ mod test {
     /// This case tests whehter the checkpoint ts (next backup ts) can be advanced correctly
     /// when async commit is enabled.
     fn async_commit() {
-        let mut suite = super::Suite::new("async_commit", 3);
+        let mut suite = super::Suite::new("async_commit", 3, false);
         run_async_test(async {
             suite.must_register_task(1, "test_async_commit");
             suite.sync();
@@ -599,7 +601,7 @@ mod test {
 
     #[test]
     fn fatal_error() {
-        let mut suite = super::Suite::new("fatal_error", 3);
+        let mut suite = super::Suite::new("fatal_error", 3, false);
         suite.must_register_task(1, "test_fatal_error");
         suite.sync();
         run_async_test(suite.write_records(0, 1, 1));
@@ -650,7 +652,7 @@ mod test {
             fail::remove("delay_on_start_observe");
             fail::remove("delay_on_flush");
         }}
-        let mut suite = super::Suite::new("inflight_message", 3);
+        let mut suite = super::Suite::new("inflight_message", 3, false);
         suite.must_register_task(1, "inflight_message");
         run_async_test(suite.write_records(0, 128, 1));
         fail::cfg("delay_on_flush", "pause").unwrap();
@@ -685,7 +687,7 @@ mod test {
 
     #[test]
     fn region_checkpoint_info() {
-        let mut suite = super::Suite::new("checkpoint_info", 1);
+        let mut suite = super::Suite::new("checkpoint_info", 1, true);
         suite.must_register_task(1, "checkpoint_info");
         suite.must_split(&make_split_key_at_record(1, 42));
         run_async_test(suite.write_records(0, 128, 1));
@@ -707,7 +709,7 @@ mod test {
         assert!(
             checkpoints
                 .iter()
-                .all(|cp| assert_matches!(cp, GetCheckpointResult::Ok { checkpoint, .. } if checkpoint > TimeStamp::new(256))),
+                .all(|cp| matches!(cp, GetCheckpointResult::Ok { checkpoint, .. } if checkpoint.into_inner() > 256)),
             "{:?}",
             checkpoints
         );
