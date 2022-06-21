@@ -28,7 +28,7 @@ use crate::{
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
-    metadata::{store::MetaStore, MetadataClient},
+    metadata::{store::MetaStore, CheckpointProvider, MetadataClient},
     metrics,
     observer::BackupStreamObserver,
     router::Router,
@@ -444,6 +444,11 @@ where
         let meta_cli = self.meta_cli.clone();
         let cp = meta_cli.get_region_checkpoint(task, region).await?;
         info!("got region checkpoint"; "region_id" => %region.get_id(), "checkpoint" => ?cp);
+        if matches!(cp.provider, CheckpointProvider::Global) {
+            metrics::STORE_CHECKPOINT_TS
+                .with_label_values(&[task])
+                .set(cp.ts.into_inner() as _);
+        }
         Ok(cp.ts)
     }
 

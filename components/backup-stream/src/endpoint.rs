@@ -46,7 +46,7 @@ use crate::{
         BasicFlushObserver, CheckpointManager, CheckpointV2FlushObserver,
         CheckpointV3FlushObserver, FlushObserver, GetCheckpointResult, VersionedRegionId,
     },
-    errors::{ContextualResultExt, Error, Result},
+    errors::{Error, Result},
     event_loader::{InitialDataLoader, PendingMemoryQuota},
     future,
     metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
@@ -536,6 +536,7 @@ where
         let cli = self.meta_client.clone();
         let init = self.make_initial_loader();
         let range_router = self.range_router.clone();
+        let use_v3 = self.config.use_checkpoint_v3;
 
         info!(
             "register backup stream task";
@@ -559,7 +560,9 @@ where
             let task_clone = task.clone();
             let run = async move {
                 let task_name = task.info.get_name();
-                cli.init_task(&task.info).await?;
+                if !use_v3 {
+                    cli.init_task(&task.info).await?;
+                }
                 let ranges = cli.ranges_of_task(task_name).await?;
                 info!(
                     "register backup stream ranges";
@@ -713,10 +716,14 @@ where
         let store_id = self.store_id;
         let mut flush_ob = self.flush_observer();
         async move {
-            let (new_rts, cps) = get_rts.await;
+            let (mut new_rts, cps) = get_rts.await;
             #[cfg(feature = "failpoints")]
             fail::fail_point!("delay_on_flush");
             flush_ob.before(cps).await;
+            if let Some(new_new_rts) = flush_ob.rewrite_resolved_ts(&task).await {
+                info!("rewriting resolved ts"; "old" => %new_rts, "new" => %new_new_rts);
+                new_rts = new_new_rts.min(new_rts);
+            }
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
                 info!("flushing and refreshing checkpoint ts.";
                     "checkpoint_ts" => %rts,

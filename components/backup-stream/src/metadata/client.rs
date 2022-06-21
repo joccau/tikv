@@ -584,13 +584,8 @@ impl<Store: MetaStore> MetadataClient<Store> {
     /// Get the global checkpoint of a task.
     /// It is the smallest checkpoint of all types of checkpoint.
     pub async fn global_checkpoint_of_task(&self, task_name: &str) -> Result<Checkpoint> {
-        let cp = match self
-            .checkpoints_of(task_name)
-            .await?
-            .iter()
-            .min_by_key(|cp| cp.ts)
-        {
-            Some(cp) => *cp,
+        let cp = match self.global_checkpoint_of(task_name).await? {
+            Some(cp) => cp,
             None => self.get_task_start_ts_checkpoint(task_name).await?,
         };
         Ok(cp)

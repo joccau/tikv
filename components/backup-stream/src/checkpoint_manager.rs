@@ -12,10 +12,10 @@ use txn_types::TimeStamp;
 
 use crate::{
     errors::{ContextualResultExt, Error, Result},
-    metadata::{store::MetaStore, MetadataClient},
+    metadata::{store::MetaStore, CheckpointProvider, MetadataClient},
     metrics,
-    subscription_track::{RegionSubscription, SubscriptionTracer},
-    try_send, Endpoint, RegionCheckpointOperation, Task,
+    subscription_track::SubscriptionTracer,
+    try_send, RegionCheckpointOperation, Task,
 };
 
 /// A manager for mataining the last flush ts.
@@ -137,15 +137,6 @@ pub struct VersionedRegionId {
     pub region_epoch_version: u64,
 }
 
-impl VersionedRegionId {
-    fn from_region(region: &Region) -> Self {
-        Self {
-            region_id: region.get_id(),
-            region_epoch_version: region.get_region_epoch().get_version(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LastFlushTsOfRegion {
     pub region: Region,
@@ -155,8 +146,20 @@ pub struct LastFlushTsOfRegion {
 // Allow some type to
 #[async_trait::async_trait]
 pub trait FlushObserver: Send + 'static {
+    /// The callback when the flush has advanced the resolver.
     async fn before(&mut self, checkpoints: Vec<(Region, TimeStamp)>);
+    /// The callback when the flush is done. (Files are fully written to external storage.)
     async fn after(&mut self, task: &str, rts: u64) -> Result<()>;
+    /// The optional callback to rewrite the resolved ts of this flush.
+    /// Because the default method (collect all leader resolved ts in the store, and use the minimal TS.)
+    /// may lead to resolved ts rolling back, if we desire a stronger consistency, we can rewrite a safer resolved ts here.
+    /// Note the new resolved ts cannot be greater than the old resolved ts.
+    async fn rewrite_resolved_ts(
+        &mut self,
+        #[allow(unused_variables)] task: &str,
+    ) -> Option<TimeStamp> {
+        None
+    }
 }
 
 pub struct BasicFlushObserver<PD, S> {
@@ -177,7 +180,7 @@ impl<PD, S> BasicFlushObserver<PD, S> {
 
 #[async_trait::async_trait]
 impl<PD: PdClient + 'static, S: MetaStore + 'static> FlushObserver for BasicFlushObserver<PD, S> {
-    async fn before(&mut self, checkpoints: Vec<(Region, TimeStamp)>) {}
+    async fn before(&mut self, _checkpoints: Vec<(Region, TimeStamp)>) {}
 
     async fn after(&mut self, task: &str, rts: u64) -> Result<()> {
         if let Err(err) = self
@@ -246,7 +249,7 @@ where
     F: FnOnce() -> bool + Send + 'static,
     O: FlushObserver,
 {
-    async fn before(&mut self, checkpoints: Vec<(Region, TimeStamp)>) {
+    async fn before(&mut self, _checkpoints: Vec<(Region, TimeStamp)>) {
         let fresh_regions = self.resolvers.collect_fresh_subs();
         let removal = self.resolvers.collect_removal_subs();
         let checkpoints = removal
@@ -322,13 +325,28 @@ where
         self.checkpoints = checkpoints;
     }
 
-    async fn after(&mut self, task: &str, rts: u64) -> Result<()> {
+    async fn after(&mut self, task: &str, _rts: u64) -> Result<()> {
         let t = Task::RegionCheckpointsOp(RegionCheckpointOperation::Update(std::mem::take(
             &mut self.checkpoints,
         )));
         try_send!(self.sched, t);
         let global_checkpoint = self.meta_cli.global_checkpoint_of_task(task).await?;
-        self.baseline.after(task, global_checkpoint.ts.into_inner());
+        info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
+        self.baseline
+            .after(task, global_checkpoint.ts.into_inner())
+            .await?;
         Ok(())
+    }
+
+    async fn rewrite_resolved_ts(&mut self, task: &str) -> Option<TimeStamp> {
+        let global_checkpoint = self
+            .meta_cli
+            .global_checkpoint_of_task(task)
+            .await
+            .map_err(|err| err.report("failed to get resolved ts for rewritting"))
+            .ok()?;
+        info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
+        matches!(global_checkpoint.provider, CheckpointProvider::Global)
+            .then(|| global_checkpoint.ts)
     }
 }
