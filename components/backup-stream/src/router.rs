@@ -817,6 +817,11 @@ impl StreamTaskInfo {
 
     /// move need-flushing files to flushing_files.
     pub async fn move_to_flushing_files(&self) -> &Self {
+        // if flushing_files is not empty, which represents this flush is a retry operation.
+        if !self.flushing_files.read().await.is_empty() {
+            return self;
+        }
+
         let mut w = self.files.write().await;
         let mut fw = self.flushing_files.write().await;
         for (k, v) in w.drain() {
