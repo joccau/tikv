@@ -81,10 +81,11 @@ impl LogBackup for Service {
                         })
                         .collect(),
                 );
-                let r = block_on(sink.success(resp));
-                if let Err(e) = r {
-                    warn!("failed to reply grpc resonse."; "err" => %e)
-                }
+                tokio::spawn(async {
+                    if let Err(e) = sink.success(resp).await {
+                        warn!("failed to reply grpc resonse."; "err" => %e)
+                    }
+                });
             }),
         ));
         try_send!(self.endpoint, t);

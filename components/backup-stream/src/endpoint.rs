@@ -817,23 +817,26 @@ where
                         .update_region_checkpoint(&region, checkpoint)
                 }
             }
-            RegionCheckpointOperation::Get(g, cb) => match g {
-                RegionSet::Universal => cb(self
-                    .checkpoint_mgr
-                    .get_all()
-                    .into_iter()
-                    .map(|c| GetCheckpointResult::ok(c.region.clone(), c.checkpoint))
-                    .collect()),
-                RegionSet::Regions(rs) => cb(rs
-                    .iter()
-                    .map(|(id, version)| {
-                        self.checkpoint_mgr.get_from_region(VersionedRegionId {
-                            region_id: *id,
-                            region_epoch_version: *version,
+            RegionCheckpointOperation::Get(g, cb) => {
+                let _guard = self.pool.handle().enter();
+                match g {
+                    RegionSet::Universal => cb(self
+                        .checkpoint_mgr
+                        .get_all()
+                        .into_iter()
+                        .map(|c| GetCheckpointResult::ok(c.region.clone(), c.checkpoint))
+                        .collect()),
+                    RegionSet::Regions(rs) => cb(rs
+                        .iter()
+                        .map(|(id, version)| {
+                            self.checkpoint_mgr.get_from_region(VersionedRegionId {
+                                region_id: *id,
+                                region_epoch_version: *version,
+                            })
                         })
-                    })
-                    .collect()),
-            },
+                        .collect()),
+                }
+            }
         }
     }
 

@@ -99,7 +99,7 @@ impl SubscriptionTracer {
     pub fn clear(&self) {
         self.0.retain(|_, v| {
             v.stop();
-            TRACK_REGION.with_label_values(&["dec"]).inc();
+            TRACK_REGION.dec();
             false
         });
     }
@@ -115,13 +115,13 @@ impl SubscriptionTracer {
         start_ts: Option<TimeStamp>,
     ) {
         info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region.get_id());
-        TRACK_REGION.with_label_values(&["inc"]).inc();
+        TRACK_REGION.inc();
         if let Some(mut o) = self.0.insert(
             region.get_id(),
             RegionSubscription::new(region.clone(), handle, start_ts),
         ) {
             if o.state != SubscriptionState::Removal {
-                TRACK_REGION.with_label_values(&["dec"]).inc();
+                TRACK_REGION.dec();
                 warn!("register region which is already registered"; "region_id" => %region.get_id());
             }
             o.stop();
@@ -176,7 +176,9 @@ impl SubscriptionTracer {
         let remove_result = self.0.get_mut(&region_id);
         match remove_result {
             Some(mut o) if if_cond(o.value(), region) => {
-                TRACK_REGION.with_label_values(&["dec"]).inc();
+                if o.state != SubscriptionState::Removal {
+                    TRACK_REGION.dec();
+                }
                 o.value_mut().stop();
                 info!("stop listen stream from store"; "observer" => ?o.value(), "region_id"=> %region_id);
                 true
