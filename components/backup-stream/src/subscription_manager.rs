@@ -1,11 +1,15 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use crossbeam::channel::{Receiver as SyncReceiver, Sender as SyncSender};
+use crossbeam_channel::SendError;
 use engine_traits::KvEngine;
 use error_code::{backup_stream::OBSERVE_CANCELED, ErrorCodeExt};
 use futures::FutureExt;
@@ -76,13 +80,19 @@ impl ScanCmd {
     }
 }
 
-fn scan_executor_loop<E, R, RT>(init: InitialDataLoader<E, R, RT>, cmds: SyncReceiver<ScanCmd>)
-where
+fn scan_executor_loop<E, R, RT>(
+    init: InitialDataLoader<E, R, RT>,
+    cmds: SyncReceiver<ScanCmd>,
+    canceled: Arc<AtomicBool>,
+) where
     E: KvEngine,
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
     while let Ok(cmd) = cmds.recv() {
+        if !canceled.load(Ordering::Acquire) {
+            return;
+        }
         metrics::PENDING_INITIAL_SCAN_LEN
             .with_label_values(&["queuing"])
             .dec();
@@ -105,32 +115,55 @@ where
 /// we make workers thread instead of spawn scan task directly into the pool because the [`InitialDataLoader`] isn't `Sync` hence
 /// we must use it very carefully or rustc (along with tokio) would complain that we made a `!Send` future.
 /// so we have moved the data loader to the synchronous context so its reference won't be shared between threads any more.
-fn spawn_executors<E, R, RT>(
-    init: InitialDataLoader<E, R, RT>,
-    number: usize,
-) -> SyncSender<ScanCmd>
+fn spawn_executors<E, R, RT>(init: InitialDataLoader<E, R, RT>, number: usize) -> ScanPoolHandle
 where
     E: KvEngine,
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E> + 'static,
 {
     let (tx, rx) = crossbeam::channel::bounded(MESSAGE_BUFFER_SIZE);
-    let pool = Arc::new(create_scan_pool(number));
+    let pool = create_scan_pool(number);
+    let stopped = Arc::new(AtomicBool::new(false));
     for _ in 0..number {
         let init = init.clone();
         let rx = rx.clone();
-        let pool_handle = pool.clone();
+        let stopped = stopped.clone();
         pool.spawn(move |_: &mut YatpHandle<'_>| {
             tikv_alloc::add_thread_memory_accessor();
             let _io_guard = file_system::WithIOType::new(file_system::IOType::Replication);
-            scan_executor_loop(init, rx);
+            scan_executor_loop(init, rx, stopped);
             tikv_alloc::remove_thread_memory_accessor();
-            // This won't make background thread deadlock,
-            // because `shutdown` won't join the handle if the target of which is current thread.
-            drop(pool_handle);
         })
     }
-    tx
+    ScanPoolHandle {
+        tx,
+        _pool: pool,
+        stopped,
+    }
+}
+
+struct ScanPoolHandle {
+    // in fact, we won't use the pool any more.
+    // but we should hold the reference to the pool so it won't try to join the threads running.
+    _pool: ScanPool,
+    tx: SyncSender<ScanCmd>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Drop for ScanPoolHandle {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+impl ScanPoolHandle {
+    fn send(&self, cmd: ScanCmd) -> std::result::Result<(), SendError<ScanCmd>> {
+        if self.stopped.load(Ordering::Acquire) {
+            warn!("scan pool is stopped, ignore the scan command"; "region" => %cmd.region.get_id());
+            return Ok(());
+        }
+        self.tx.send(cmd)
+    }
 }
 
 /// The default channel size.
@@ -151,7 +184,7 @@ pub struct RegionSubscriptionManager<S, R, PDC> {
     subs: SubscriptionTracer,
 
     messenger: Sender<ObserveOp>,
-    scan_pool_handle: SyncSender<ScanCmd>,
+    scan_pool_handle: Arc<ScanPoolHandle>,
     scans: Arc<CallbackWaitGroup>,
 }
 
@@ -218,7 +251,7 @@ where
             observer,
             subs: initial_loader.tracing,
             messenger: tx,
-            scan_pool_handle,
+            scan_pool_handle: Arc::new(scan_pool_handle),
             scans: CallbackWaitGroup::new(),
         };
         let fut = op.clone().region_operator_loop(rx);
@@ -449,8 +482,8 @@ where
             .with_label_values(&["queuing"])
             .inc();
         // we should not spawn initial scanning tasks to the tokio blocking pool
-        // beacuse it is also used for converting sync File I/O to async. (for now!)
-        // In that condition, if we blocking for some resouces(for example, the `MemoryQuota`)
+        // because it is also used for converting sync File I/O to async. (for now!)
+        // In that condition, if we blocking for some resources(for example, the `MemoryQuota`)
         // at the block threads, we may meet some ghosty deadlock.
         let s = self.scan_pool_handle.send(cmd);
         if let Err(err) = s {
