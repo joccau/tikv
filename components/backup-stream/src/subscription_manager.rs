@@ -80,7 +80,7 @@ where
         let snap = self.observe_over_with_retry(region, move || {
             ChangeObserver::from_pitr(region_id, handle.clone())
         })?;
-        let stat = self.do_initial_scan(&region, start_ts, snap, on_finish)?;
+        let stat = self.do_initial_scan(region, start_ts, snap, on_finish)?;
         Ok(stat)
     }
 }
@@ -536,18 +536,12 @@ where
 }
 
 mod test {
-    use std::time::Duration;
-
-    use futures::executor::block_on;
     use kvproto::metapb::Region;
-    use raftstore::coprocessor::region_info_accessor::MockRegionInfoProvider;
     use tikv::storage::Statistics;
 
     use super::InitialScan;
-    use crate::{
-        event_loader::InitialDataLoader, subscription_manager::spawn_executors,
-        utils::CallbackWaitGroup,
-    };
+    #[cfg(feature = "failpoints")]
+    use crate::{subscription_manager::spawn_executors, utils::CallbackWaitGroup};
 
     #[derive(Clone, Copy)]
     struct NoopInitialScan;
@@ -565,7 +559,8 @@ mod test {
         }
     }
 
-    fn should_finish_in(f: impl FnOnce() + Send + 'static, d: Duration) {
+    #[cfg(feature = "failpoints")]
+    fn should_finish_in(f: impl FnOnce() + Send + 'static, d: std::time::Duration) {
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             f();
