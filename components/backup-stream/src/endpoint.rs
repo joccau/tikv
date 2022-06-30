@@ -26,7 +26,7 @@ use tikv::config::BackupStreamConfig;
 use tikv_util::{
     config::ReadableDuration,
     debug, defer, info,
-    time::Instant,
+    time::{Instant, Limiter},
     warn,
     worker::{Runnable, Scheduler},
     HandyRwLock,
@@ -75,6 +75,7 @@ pub struct Endpoint<S, R, E, RT, PDC> {
     subs: SubscriptionTracer,
     concurrency_manager: ConcurrencyManager,
     initial_scan_memory_quota: PendingMemoryQuota,
+    initial_scan_throughput_quota: Limiter,
     region_operator: RegionSubscriptionManager<S, R, PDC>,
     failover_time: Option<Instant>,
     config: BackupStreamConfig,
@@ -126,6 +127,7 @@ where
 
         let initial_scan_memory_quota =
             PendingMemoryQuota::new(config.initial_scan_pending_memory_quota.0 as _);
+        let initial_scan_throughput_quota = Limiter::new(config.initial_scan_rate_limit.0 as _);
         info!("the endpoint of stream backup started"; "path" => %config.temp_path);
         let subs = SubscriptionTracer::default();
         let (region_operator, op_loop) = RegionSubscriptionManager::start(
@@ -137,6 +139,7 @@ where
                 scheduler.clone(),
                 initial_scan_memory_quota.clone(),
                 pool.handle().clone(),
+                initial_scan_throughput_quota.clone(),
             ),
             observer.clone(),
             meta_client.clone(),
@@ -158,6 +161,7 @@ where
             subs,
             concurrency_manager,
             initial_scan_memory_quota,
+            initial_scan_throughput_quota,
             region_operator,
             failover_time: None,
             config,
@@ -435,6 +439,7 @@ where
             self.scheduler.clone(),
             self.initial_scan_memory_quota.clone(),
             self.pool.handle().clone(),
+            self.initial_scan_throughput_quota.clone(),
         )
     }
 

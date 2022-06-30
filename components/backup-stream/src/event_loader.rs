@@ -20,7 +20,12 @@ use tikv::storage::{
     txn::{EntryBatch, TxnEntry, TxnEntryScanner},
     Snapshot, Statistics,
 };
-use tikv_util::{box_err, time::Instant, warn, worker::Scheduler};
+use tikv_util::{
+    box_err,
+    time::{Instant, Limiter},
+    warn,
+    worker::Scheduler,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use txn_types::{Key, Lock, TimeStamp};
 
@@ -182,6 +187,7 @@ pub struct InitialDataLoader<E, R, RT> {
     pub(crate) scheduler: Scheduler<Task>,
     pub(crate) quota: PendingMemoryQuota,
     pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) limit: Limiter,
 
     _engine: PhantomData<E>,
 }
@@ -200,6 +206,7 @@ where
         sched: Scheduler<Task>,
         quota: PendingMemoryQuota,
         handle: tokio::runtime::Handle,
+        limiter: Limiter,
     ) -> Self {
         Self {
             router,
@@ -210,6 +217,7 @@ where
             _engine: PhantomData,
             quota,
             handle,
+            limit: limiter,
         }
     }
 
@@ -368,7 +376,13 @@ where
         loop {
             let mut events = ApplyEvents::with_capacity(1024, region.id);
             let stat = event_loader.fill_entries()?;
-            self.with_resolver(region, |r| event_loader.omit_entries_to(&mut events, r))?;
+            let disk_read = self.with_resolver(region, |r| {
+                let (result, byte_size) = utils::with_record_read_throughput(|| {
+                    event_loader.omit_entries_to(&mut events, r)
+                });
+                result?;
+                Result::Ok(byte_size)
+            })?;
             if events.is_empty() {
                 metrics::INITIAL_SCAN_DURATION.observe(start.saturating_elapsed_secs());
                 return Ok(stats.stat);
@@ -379,6 +393,7 @@ where
             let event_size = events.size();
             let sched = self.scheduler.clone();
             let permit = self.quota.pending(event_size);
+            self.limit.blocking_consume(disk_read as _);
             debug!("sending events to router"; "size" => %event_size, "region" => %region_id);
             metrics::INCREMENTAL_SCAN_SIZE.observe(event_size as f64);
             metrics::HEAP_MEMORY.add(event_size as _);
