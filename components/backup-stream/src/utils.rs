@@ -17,7 +17,7 @@ use futures::{channel::mpsc, executor::block_on, FutureExt, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
-use tikv::storage::{CfStatistics, Statistics};
+use tikv::storage::CfStatistics;
 use tikv_util::{
     box_err,
     sys::inspector::{
