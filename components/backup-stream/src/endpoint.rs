@@ -132,7 +132,7 @@ where
         } else {
             f64::INFINITY
         };
-        let initial_scan_throughput_quota = Limiter::new(config.initial_scan_rate_limit.0 as _);
+        let initial_scan_throughput_quota = Limiter::new(limit);
         info!("the endpoint of stream backup started"; "path" => %config.temp_path);
         let subs = SubscriptionTracer::default();
         let (region_operator, op_loop) = RegionSubscriptionManager::start(
