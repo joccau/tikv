@@ -302,9 +302,10 @@ where
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
                     let cps = self.subs.resolve_with(min_ts);
+                    let min_region = cps.iter().min_by_key(|(_, rts)| rts);
                     // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
-                    let rts = cps.iter().map(|(_, t)| *t).min().unwrap_or(min_ts);
-
+                    let rts = min_region.map(|(_, rts)| *rts).unwrap_or(min_ts);
+                    info!("getting checkpoint"; "defined_by_region" => ?min_region.map(|r| r.0.get_id()), "checkpoint" => %rts);
                     self.subs.warn_if_gap_too_huge(rts);
                     callback(rts, cps);
                 }

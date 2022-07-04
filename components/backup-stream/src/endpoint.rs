@@ -752,6 +752,7 @@ where
     pub fn on_flush(&self, task: String) {
         self.pool.block_on(async move {
             let mts = self.prepare_min_ts().await;
+            info!("min_ts prepared for flushing"; "min_ts" => %mts);
             try_send!(self.scheduler, Task::FlushWithMinTs(task, mts));
         })
     }
