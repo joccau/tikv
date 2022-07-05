@@ -2346,6 +2346,8 @@ pub struct BackupStreamConfig {
     pub temp_file_size_limit_per_task: ReadableSize,
     #[online_config(skip)]
     pub initial_scan_pending_memory_quota: ReadableSize,
+    #[online_config(skip)]
+    pub initial_scan_rate_limit: ReadableSize,
 }
 
 impl BackupStreamConfig {
@@ -2372,6 +2374,7 @@ impl Default for BackupStreamConfig {
             temp_path: String::new(),
             temp_file_size_limit_per_task: ReadableSize::mb(128),
             initial_scan_pending_memory_quota: ReadableSize(quota_size as _),
+            initial_scan_rate_limit: ReadableSize::mb(60),
         }
     }
 }
