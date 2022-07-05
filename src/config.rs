@@ -2347,6 +2347,8 @@ pub struct BackupStreamConfig {
     #[online_config(skip)]
     pub initial_scan_pending_memory_quota: ReadableSize,
     #[online_config(skip)]
+    pub initial_scan_rate_limit: ReadableSize,
+    #[online_config(skip)]
     pub use_checkpoint_v3: bool,
 }
 
@@ -2375,6 +2377,7 @@ impl Default for BackupStreamConfig {
             temp_file_size_limit_per_task: ReadableSize::mb(128),
             initial_scan_pending_memory_quota: ReadableSize(quota_size as _),
             use_checkpoint_v3: true,
+            initial_scan_rate_limit: ReadableSize::mb(60),
         }
     }
 }

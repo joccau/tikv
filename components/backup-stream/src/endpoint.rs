@@ -27,7 +27,7 @@ use tikv::config::BackupStreamConfig;
 use tikv_util::{
     config::ReadableDuration,
     debug, defer, info,
-    time::Instant,
+    time::{Instant, Limiter},
     warn,
     worker::{Runnable, Scheduler},
     HandyRwLock,
@@ -60,6 +60,8 @@ use crate::{
 };
 
 const SLOW_EVENT_THRESHOLD: f64 = 120.0;
+/// CHECKPOINT_SAFEPOINT_TTL_IF_ERROR specifies the safe point TTL(24 hour) if task has fatal error.
+const CHECKPOINT_SAFEPOINT_TTL_IF_ERROR: u64 = 24;
 
 pub struct Endpoint<S, R, E, RT, PDC> {
     // Note: those fields are more like a shared context between components.
@@ -79,6 +81,7 @@ pub struct Endpoint<S, R, E, RT, PDC> {
     observer: BackupStreamObserver,
     pool: Runtime,
     initial_scan_memory_quota: PendingMemoryQuota,
+    initial_scan_throughput_quota: Limiter,
     region_operator: RegionSubscriptionManager<S, R, PDC>,
     failover_time: Option<Instant>,
     config: BackupStreamConfig,
@@ -131,6 +134,12 @@ where
 
         let initial_scan_memory_quota =
             PendingMemoryQuota::new(config.initial_scan_pending_memory_quota.0 as _);
+        let limit = if config.initial_scan_rate_limit > 0 {
+            config.initial_scan_rate_limit as f64
+        } else {
+            f64::INFINITY
+        };
+        let initial_scan_throughput_quota = Limiter::new(limit);
         info!("the endpoint of stream backup started"; "path" => %config.temp_path);
         let subs = SubscriptionTracer::default();
         let (region_operator, op_loop) = RegionSubscriptionManager::start(
@@ -142,6 +151,7 @@ where
                 scheduler.clone(),
                 initial_scan_memory_quota.clone(),
                 pool.handle().clone(),
+                initial_scan_throughput_quota.clone(),
             ),
             observer.clone(),
             meta_client.clone(),
@@ -163,6 +173,7 @@ where
             subs,
             concurrency_manager,
             initial_scan_memory_quota,
+            initial_scan_throughput_quota,
             region_operator,
             failover_time: None,
             config,
@@ -464,6 +475,7 @@ where
             self.scheduler.clone(),
             self.initial_scan_memory_quota.clone(),
             self.pool.handle().clone(),
+            self.initial_scan_throughput_quota.clone(),
         )
     }
 
@@ -608,7 +620,7 @@ where
     }
 
     fn pause_guard_duration(&self) -> Duration {
-        ReadableDuration::hours(24).0
+        ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_ERROR).0
     }
 
     pub fn on_pause(&self, task: &str) {
@@ -639,12 +651,20 @@ where
 
     pub fn on_unregister(&self, task: &str) -> Option<StreamBackupTaskInfo> {
         let info = self.unload_task(task);
-
-        // reset the checkpoint ts of the task so it won't mislead the metrics.
-        metrics::STORE_CHECKPOINT_TS
-            .with_label_values(&[task])
-            .set(0);
+        self.remove_metrics_after_unregister(task);
         info
+    }
+
+    fn remove_metrics_after_unregister(&self, task: &str) {
+        // remove metrics of the task so it won't mislead the metrics.
+        let _ = metrics::STORE_CHECKPOINT_TS
+            .remove_label_values(&[task])
+            .map_err(
+                |err| info!("failed to remove checkpoint ts metric"; "task" => task, "err" => %err),
+            );
+        let _ = metrics::remove_task_status_metric(task).map_err(
+            |err| info!("failed to remove checkpoint ts metric"; "task" => task, "err" => %err),
+        );
     }
 
     /// unload a task from memory: this would stop observe the changes required by the task temporarily.

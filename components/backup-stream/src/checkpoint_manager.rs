@@ -18,6 +18,10 @@ use crate::{
     try_send, RegionCheckpointOperation, Task,
 };
 
+/// CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE specifies the safe point TTL(12 hour) for checkpoint-ts.
+/// If the checkpoint-ts advances, the safe-point of old checkpoint-ts will be overwrite by new one.
+const CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE: u64 = 12;
+
 /// A manager for maintaining the last flush ts.
 #[derive(Debug, Default)]
 pub struct CheckpointManager {
@@ -201,7 +205,7 @@ impl<PD: PdClient + 'static, S: MetaStore + 'static> FlushObserver for BasicFlus
                 TimeStamp::new(rts),
                 // Add a service safe point for 30 mins (6x the default flush interval).
                 // It would probably be safe.
-                Duration::from_secs(1800),
+                ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE).0,
             )
             .await
         {
