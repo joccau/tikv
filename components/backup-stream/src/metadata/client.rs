@@ -17,7 +17,10 @@ use super::{
         Snapshot, Subscription, Transaction, WithRevision,
     },
 };
-use crate::errors::{ContextualResultExt, Error, Result};
+use crate::{
+    debug,
+    errors::{ContextualResultExt, Error, Result},
+};
 
 /// Some operations over stream backup metadata key space.
 #[derive(Clone)]
@@ -593,11 +596,9 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
     /// get the global progress (the min next_backup_ts among all stores).
     pub async fn global_progress_of_task(&self, task_name: &str) -> Result<u64> {
-        let ts = self
-            .global_checkpoint_of_task(task_name)
-            .await?
-            .ts
-            .into_inner();
+        let cp = self.global_checkpoint_of_task(task_name).await?;
+        debug!("getting global progress of task"; "checkpoint" => ?cp);
+        let ts = cp.ts.into_inner();
         Ok(ts)
     }
 
@@ -671,7 +672,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
                 CheckpointProvider::Store(..) => {
                     if min_checkpoint
                         .as_ref()
-                        .map(|c: &Checkpoint| c.ts < cp.ts)
+                        .map(|c: &Checkpoint| c.ts > cp.ts)
                         .unwrap_or(true)
                     {
                         min_checkpoint = Some(cp);

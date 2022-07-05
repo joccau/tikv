@@ -17,7 +17,7 @@ use raftstore::{
     router::RaftStoreRouter,
     store::fsm::ChangeObserver,
 };
-use tikv_util::{info, time::Instant, warn, worker::Scheduler};
+use tikv_util::{box_err, info, time::Instant, warn, worker::Scheduler};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use txn_types::TimeStamp;
 use yatp::task::callback::Handle as YatpHandle;
@@ -369,6 +369,10 @@ where
             }
 
             Some(for_task) => {
+                #[cfg(feature = "failpoints")]
+                fail::fail_point!("try_start_observe", |_| {
+                    Err(Error::Other(box_err!("Nature is boring")))
+                });
                 let tso = self.get_last_checkpoint_of(&for_task, region).await?;
                 self.observe_over_with_initial_data_from_checkpoint(region, tso, handle.clone());
             }
@@ -379,6 +383,7 @@ where
     async fn start_observe(&self, region: Region) {
         let handle = ObserveHandle::new();
         if let Err(err) = self.try_start_observe(&region, handle.clone()).await {
+            warn!("failed to start observe, retrying"; "err" => %err);
             try_send!(
                 self.scheduler,
                 Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
@@ -421,14 +426,18 @@ where
             metrics::SKIP_RETRY.with_label_values(&["not-leader"]).inc();
             return Ok(());
         }
+        // Note: we may fail before we insert the region info to the subscription map.
+        // At that time, the command isn't steal and we should retry it.
+        let mut exists = false;
         let removed = self.subs.deregister_region_if(&region, |old, _| {
+            exists = true;
             let should_remove = old.handle().id == handle.id;
             if !should_remove {
                 warn!("stale retry command"; "region" => ?region, "handle" => ?handle, "old_handle" => ?old.handle());
             }
             should_remove
         });
-        if !removed {
+        if !removed && exists {
             metrics::SKIP_RETRY
                 .with_label_values(&["stale-command"])
                 .inc();

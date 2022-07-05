@@ -276,9 +276,8 @@ where
                 return Ok(());
             }
         }
-        self.base.after(task, rts).await?;
         // Optionally upload the region checkpoint.
-        // Unless in some exteme condition, skipping upload the region checkpoint won't lead to data loss.
+        // Unless in some extreme condition, skipping upload the region checkpoint won't lead to data loss.
         if let Err(err) = self
             .meta_cli
             .upload_region_checkpoint(&task, &self.checkpoints)
@@ -286,6 +285,7 @@ where
         {
             err.report("failed to upload region checkpoint");
         }
+        self.base.after(task, rts).await?;
         self.meta_cli
             .clear_region_checkpoint(&task, &self.fresh_regions)
             .await
@@ -298,6 +298,7 @@ pub struct CheckpointV3FlushObserver<S, O> {
     sched: Scheduler<Task>,
     meta_cli: MetadataClient<S>,
     checkpoints: Vec<(Region, TimeStamp)>,
+    subs: SubscriptionTracer,
 
     /// We should modify the rts (the local rts isn't right.)
     /// This should be a BasicFlushObserver or something likewise.
@@ -305,11 +306,17 @@ pub struct CheckpointV3FlushObserver<S, O> {
 }
 
 impl<S, O> CheckpointV3FlushObserver<S, O> {
-    pub fn new(sched: Scheduler<Task>, meta_cli: MetadataClient<S>, baseline: O) -> Self {
+    pub fn new(
+        sched: Scheduler<Task>,
+        meta_cli: MetadataClient<S>,
+        subs: SubscriptionTracer,
+        baseline: O,
+    ) -> Self {
         Self {
             sched,
             meta_cli,
             checkpoints: vec![],
+            subs,
             baseline,
         }
     }
@@ -326,6 +333,7 @@ where
     }
 
     async fn after(&mut self, task: &str, _rts: u64) -> Result<()> {
+        self.subs.update_status_for_v3();
         let t = Task::RegionCheckpointsOp(RegionCheckpointOperation::Update(std::mem::take(
             &mut self.checkpoints,
         )));
@@ -343,7 +351,7 @@ where
             .meta_cli
             .global_checkpoint_of_task(task)
             .await
-            .map_err(|err| err.report("failed to get resolved ts for rewritting"))
+            .map_err(|err| err.report("failed to get resolved ts for rewriting"))
             .ok()?;
         info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
         matches!(global_checkpoint.provider, CheckpointProvider::Global)

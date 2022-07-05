@@ -814,6 +814,7 @@ where
                 // Or they may slow down the global checkpoint.
                 self.checkpoint_mgr.clear();
                 for (region, checkpoint) in u {
+                    debug!("setting region checkpoint"; "region" => %region.get_id(), "ts" => %checkpoint);
                     self.checkpoint_mgr
                         .update_region_checkpoint(&region, checkpoint)
                 }
