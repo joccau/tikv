@@ -26,7 +26,7 @@ use tikv::config::BackupStreamConfig;
 use tikv_util::{
     config::ReadableDuration,
     debug, defer, info,
-    time::Instant,
+    time::{Instant, Limiter},
     warn,
     worker::{Runnable, Scheduler},
     HandyRwLock,
@@ -55,6 +55,11 @@ use crate::{
 };
 
 const SLOW_EVENT_THRESHOLD: f64 = 120.0;
+/// CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE specifies the safe point TTL(12 hour) for checkpoint-ts.
+/// If the checkpoint-ts advances, the safe-point of old checkpoint-ts will be overwrite by new one.
+const CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE: u64 = 12;
+/// CHECKPOINT_SAFEPOINT_TTL_IF_ERROR specifies the safe point TTL(24 hour) if task has fatal error.
+const CHECKPOINT_SAFEPOINT_TTL_IF_ERROR: u64 = 24;
 
 pub struct Endpoint<S, R, E, RT, PDC> {
     meta_client: MetadataClient<S>,
@@ -70,6 +75,7 @@ pub struct Endpoint<S, R, E, RT, PDC> {
     subs: SubscriptionTracer,
     concurrency_manager: ConcurrencyManager,
     initial_scan_memory_quota: PendingMemoryQuota,
+    initial_scan_throughput_quota: Limiter,
     region_operator: RegionSubscriptionManager<S, R, PDC>,
     failover_time: Option<Instant>,
     config: BackupStreamConfig,
@@ -121,6 +127,12 @@ where
 
         let initial_scan_memory_quota =
             PendingMemoryQuota::new(config.initial_scan_pending_memory_quota.0 as _);
+        let limit = if config.initial_scan_rate_limit > 0 {
+            config.initial_scan_rate_limit as f64
+        } else {
+            f64::INFINITY
+        };
+        let initial_scan_throughput_quota = Limiter::new(limit);
         info!("the endpoint of stream backup started"; "path" => %config.temp_path);
         let subs = SubscriptionTracer::default();
         let (region_operator, op_loop) = RegionSubscriptionManager::start(
@@ -132,6 +144,7 @@ where
                 scheduler.clone(),
                 initial_scan_memory_quota.clone(),
                 pool.handle().clone(),
+                initial_scan_throughput_quota.clone(),
             ),
             observer.clone(),
             meta_client.clone(),
@@ -153,6 +166,7 @@ where
             subs,
             concurrency_manager,
             initial_scan_memory_quota,
+            initial_scan_throughput_quota,
             region_operator,
             failover_time: None,
             config,
@@ -430,6 +444,7 @@ where
             self.scheduler.clone(),
             self.initial_scan_memory_quota.clone(),
             self.pool.handle().clone(),
+            self.initial_scan_throughput_quota.clone(),
         )
     }
 
@@ -571,7 +586,7 @@ where
     }
 
     fn pause_guard_duration(&self) -> Duration {
-        ReadableDuration::hours(24).0
+        ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_ERROR).0
     }
 
     pub fn on_pause(&self, task: &str) {
@@ -729,9 +744,9 @@ where
                     .update_service_safe_point(
                         format!("backup-stream-{}-{}", task, store_id),
                         TimeStamp::new(rts),
-                        // Add a service safe point for 30 mins (6x the default flush interval).
+                        // Add a service safe point for 12 hour.
                         // It would probably be safe.
-                        Duration::from_secs(1800),
+                        ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE).0,
                     )
                     .await
                 {

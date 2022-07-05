@@ -11,13 +11,23 @@ use std::{
     time::Duration,
 };
 
+use engine_rocks::ReadPerfInstant;
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use futures::{channel::mpsc, executor::block_on, FutureExt, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 use tikv::storage::CfStatistics;
-use tikv_util::{box_err, time::Instant, warn, worker::Scheduler, Either};
+use tikv_util::{
+    box_err,
+    sys::inspector::{
+        self_thread_inspector, IoStat, ThreadInspector, ThreadInspectorImpl as OsInspector,
+    },
+    time::Instant,
+    warn,
+    worker::Scheduler,
+    Either,
+};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use txn_types::{Key, Lock, LockType};
 
@@ -473,6 +483,59 @@ impl Drop for Work {
     }
 }
 
+struct ReadThroughputRecorder {
+    // The system tool set.
+    ins: Option<OsInspector>,
+    begin: Option<IoStat>,
+    // Once the system tool set get unavailable,
+    // we would use the "ejector" -- RocksDB perf context.
+    // NOTE: In fact I'm not sure whether we need the result of system level tool set --
+    //       but this is the current implement of cdc. We'd better keep consistent with them.
+    ejector: ReadPerfInstant,
+}
+
+impl ReadThroughputRecorder {
+    fn start() -> Self {
+        let r = self_thread_inspector().ok().and_then(|insp| {
+            let stat = insp.io_stat().ok()??;
+            Some((insp, stat))
+        });
+        match r {
+            Some((ins, begin)) => Self {
+                ins: Some(ins),
+                begin: Some(begin),
+                ejector: ReadPerfInstant::new(),
+            },
+            _ => Self {
+                ins: None,
+                begin: None,
+                ejector: ReadPerfInstant::new(),
+            },
+        }
+    }
+
+    fn try_get_delta_from_unix(&self) -> Option<u64> {
+        let ins = self.ins.as_ref()?;
+        let begin = self.begin.as_ref()?;
+        let end = ins.io_stat().ok()??;
+        Some(end.read - begin.read)
+    }
+
+    fn end(self) -> u64 {
+        self.try_get_delta_from_unix()
+            .unwrap_or_else(|| self.ejector.delta().block_read_byte)
+    }
+}
+
+/// try to record read throughput.
+/// this uses the `proc` fs in the linux for recording the throughput.
+/// if that failed, we would use the RocksDB perf context.
+pub fn with_record_read_throughput<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let recorder = ReadThroughputRecorder::start();
+    let r = f();
+    (r, recorder.end())
+}
+
 #[cfg(test)]
 mod test {
     use std::{
@@ -483,6 +546,8 @@ mod test {
         time::Duration,
     };
 
+    use engine_rocks::raw::DBOptions;
+    use engine_traits::WriteOptions;
     use futures::executor::block_on;
 
     use crate::utils::{CallbackWaitGroup, SegmentMap};
@@ -571,5 +636,56 @@ mod test {
         for case in cases {
             run_case(case)
         }
+    }
+
+    #[test]
+    fn test_recorder() {
+        use engine_rocks::{raw::DB, RocksEngine};
+        use engine_traits::{Iterable, KvEngine, Mutable, WriteBatch, WriteBatchExt, CF_DEFAULT};
+        use tempdir::TempDir;
+
+        let p = TempDir::new("test_db").unwrap();
+        let mut opt = DBOptions::default();
+        opt.create_if_missing(true);
+        let db = DB::open(opt.clone(), p.path().as_os_str().to_str().unwrap()).unwrap();
+        let engine = RocksEngine::from_db(Arc::new(db));
+        let mut wb = engine.write_batch();
+        for i in 0..100 {
+            wb.put_cf(CF_DEFAULT, format!("hello{}", i).as_bytes(), b"world")
+                .unwrap();
+        }
+        let mut wopt = WriteOptions::new();
+        wopt.set_sync(true);
+        wb.write_opt(&wopt).unwrap();
+        // force memtable to disk.
+        engine.get_sync_db().compact_range(None, None);
+
+        let (items, size) = super::with_record_read_throughput(|| {
+            let mut items = vec![];
+            let snap = engine.snapshot();
+            snap.scan(b"", b"", false, |k, v| {
+                items.push((k.to_owned(), v.to_owned()));
+                Ok(true)
+            })
+            .unwrap();
+            items
+        });
+
+        let items_size = items.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() as u64;
+
+        // considering the compression, we may get at least 1/2 of the real size.
+        assert!(
+            size > items_size / 2,
+            "the size recorded is too small: {} vs {}",
+            size,
+            items_size
+        );
+        // considering the read amplification, we may get at most 2x of the real size.
+        assert!(
+            size < items_size * 2,
+            "the size recorded is too big: {} vs {}",
+            size,
+            items_size
+        );
     }
 }
