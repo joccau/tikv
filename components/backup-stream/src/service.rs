@@ -2,13 +2,12 @@
 
 use std::collections::HashSet;
 
-use futures::executor::block_on;
 use grpcio::RpcContext;
 use kvproto::{logbackuppb::*, metapb::Region};
 use tikv_util::{warn, worker::Scheduler};
 
 use crate::{
-    checkpoint_manager::{GetCheckpointResult, VersionedRegionId},
+    checkpoint_manager::{GetCheckpointResult, RegionIdWithVersion},
     endpoint::{RegionCheckpointOperation, RegionSet},
     try_send, Task,
 };
@@ -31,7 +30,7 @@ fn id_of(region: &Region) -> RegionIdentity {
     id
 }
 
-impl Into<RegionIdentity> for VersionedRegionId {
+impl Into<RegionIdentity> for RegionIdWithVersion {
     fn into(self) -> RegionIdentity {
         let mut id = RegionIdentity::new();
         id.set_id(self.region_id);

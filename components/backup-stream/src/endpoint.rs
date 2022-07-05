@@ -44,7 +44,7 @@ use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
     checkpoint_manager::{
         BasicFlushObserver, CheckpointManager, CheckpointV2FlushObserver,
-        CheckpointV3FlushObserver, FlushObserver, GetCheckpointResult, VersionedRegionId,
+        CheckpointV3FlushObserver, FlushObserver, GetCheckpointResult, RegionIdWithVersion,
     },
     errors::{Error, Result},
     event_loader::{InitialDataLoader, PendingMemoryQuota},
@@ -378,6 +378,7 @@ where
             Box::new(CheckpointV3FlushObserver::new(
                 self.scheduler.clone(),
                 self.meta_client.clone(),
+                self.subs.clone(),
                 basic,
             ))
         } else {
@@ -831,10 +832,8 @@ where
                     RegionSet::Regions(rs) => cb(rs
                         .iter()
                         .map(|(id, version)| {
-                            self.checkpoint_mgr.get_from_region(VersionedRegionId {
-                                region_id: *id,
-                                region_epoch_version: *version,
-                            })
+                            self.checkpoint_mgr
+                                .get_from_region(RegionIdWithVersion::new(*id, *version))
                         })
                         .collect()),
                 }

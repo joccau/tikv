@@ -610,8 +610,6 @@ mod test {
 
     #[test]
     fn basic() {
-        test_util::init_log_for_test();
-
         let mut suite = super::SuiteBuilder::new_named("basic").use_v3().build();
         fail::cfg("try_start_observe", "1*return").unwrap();
 

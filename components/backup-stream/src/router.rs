@@ -1358,7 +1358,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_file() -> Result<()> {
-        test_util::init_log_for_test();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&tmp).await?;
         let (tx, rx) = dummy_scheduler();
@@ -1561,7 +1560,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_when_stop() -> Result<()> {
-        test_util::init_log_for_test();
         let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         let router = Arc::new(RouterInner::new(
@@ -1618,8 +1616,8 @@ mod tests {
                 i.storage = Arc::new(ErrorStorage::with_always_error(i.storage.clone()))
             })
             .await;
-        for i in 0..=16 {
-            check_on_events_result(&router.on_events(build_kv_event(i * 10, 10)).await);
+        for i in 0..=super::FLUSH_FAILURE_BECOME_FATAL_THRESHOLD {
+            check_on_events_result(&router.on_events(build_kv_event(i as i32 * 10, 10)).await);
             assert_eq!(
                 router
                     .do_flush("flush_failure", 42, TimeStamp::zero())

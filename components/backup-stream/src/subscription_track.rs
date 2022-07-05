@@ -497,19 +497,20 @@ mod test {
         region4_sub.resolver.phase_one_done();
         region4_sub
             .resolver
-            .track_lock(TimeStamp::new(75), b"Alpi".to_vec());
+            .track_lock(TimeStamp::new(128), b"Alpi".to_vec());
         subs.register_region(&region(5, 8, 1), ObserveHandle::new(), None);
         subs.deregister_region_if(&region(5, 8, 1), |_, _| true);
         drop(region4_sub);
 
-        let rs = subs.resolve_with(TimeStamp::new(1000));
+        let mut rs = subs.resolve_with(TimeStamp::new(1000));
+        rs.sort_by_key(|k| k.0.get_id());
         assert_eq!(
             rs,
             vec![
                 (region(1, 1, 1), TimeStamp::new(42)),
                 (region(2, 2, 1), TimeStamp::new(1000)),
                 (region(3, 4, 1), TimeStamp::new(1000)),
-                (region(4, 8, 1), TimeStamp::new(92)),
+                (region(4, 8, 1), TimeStamp::new(128)),
             ]
         );
         let removal = subs.collect_removal_subs();

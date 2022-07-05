@@ -12,13 +12,13 @@ use txn_types::TimeStamp;
 
 use crate::{
     errors::{ContextualResultExt, Error, Result},
-    metadata::{store::MetaStore, CheckpointProvider, MetadataClient},
+    metadata::{store::MetaStore, Checkpoint, CheckpointProvider, MetadataClient},
     metrics,
     subscription_track::SubscriptionTracer,
     try_send, RegionCheckpointOperation, Task,
 };
 
-/// A manager for mataining the last flush ts.
+/// A manager for maintaining the last flush ts.
 #[derive(Debug, Default)]
 pub struct CheckpointManager {
     items: HashMap<u64, LastFlushTsOfRegion>,
@@ -31,7 +31,7 @@ pub enum GetCheckpointResult {
         checkpoint: TimeStamp,
     },
     NotFound {
-        id: VersionedRegionId,
+        id: RegionIdWithVersion,
         err: PbError,
     },
     EpochNotMatch {
@@ -46,7 +46,7 @@ impl GetCheckpointResult {
         Self::Ok { region, checkpoint }
     }
 
-    fn not_found(id: VersionedRegionId) -> Self {
+    fn not_found(id: RegionIdWithVersion) -> Self {
         Self::NotFound {
             id,
             err: not_leader(id.region_id),
@@ -54,7 +54,7 @@ impl GetCheckpointResult {
     }
 
     /// create a epoch not match variant with region
-    fn epoch_not_match(provided: VersionedRegionId, real: &Region) -> Self {
+    fn epoch_not_match(provided: RegionIdWithVersion, real: &Region) -> Self {
         Self::EpochNotMatch {
             region: real.clone(),
             err: epoch_not_match(
@@ -72,26 +72,28 @@ impl CheckpointManager {
         self.items.clear();
     }
 
-    /// upadte a region checkpoint in need.
+    /// update a region checkpoint in need.
     pub fn update_region_checkpoint(&mut self, region: &Region, checkpoint: TimeStamp) {
         let e = self.items.entry(region.get_id());
-        let old_cp = e.or_insert_with(|| LastFlushTsOfRegion {
+        e.and_modify(|old_cp| {
+            if old_cp.checkpoint < checkpoint
+                && old_cp.region.get_region_epoch().get_version()
+                    <= region.get_region_epoch().get_version()
+            {
+                *old_cp = LastFlushTsOfRegion {
+                    checkpoint,
+                    region: region.clone(),
+                };
+            }
+        })
+        .or_insert_with(|| LastFlushTsOfRegion {
             checkpoint,
             region: region.clone(),
         });
-        if old_cp.checkpoint < checkpoint
-            || old_cp.region.get_region_epoch().get_version()
-                < region.get_region_epoch().get_version()
-        {
-            *old_cp = LastFlushTsOfRegion {
-                checkpoint,
-                region: region.clone(),
-            };
-        }
     }
 
     /// get checkpoint from a region.
-    pub fn get_from_region(&self, region: VersionedRegionId) -> GetCheckpointResult {
+    pub fn get_from_region(&self, region: RegionIdWithVersion) -> GetCheckpointResult {
         let checkpoint = self.items.get(&region.region_id);
         if checkpoint.is_none() {
             return GetCheckpointResult::not_found(region);
@@ -132,9 +134,18 @@ fn epoch_not_match(id: u64, sent: u64, real: u64) -> PbError {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 /// A simple region id, but versioned.
-pub struct VersionedRegionId {
+pub struct RegionIdWithVersion {
     pub region_id: u64,
     pub region_epoch_version: u64,
+}
+
+impl RegionIdWithVersion {
+    pub fn new(id: u64, version: u64) -> Self {
+        Self {
+            region_id: id,
+            region_epoch_version: version,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,13 +209,6 @@ impl<PD: PdClient + 'static, S: MetaStore + 'static> FlushObserver for BasicFlus
             // don't give up?
         }
 
-        // we can advance the progress at next time.
-        // return early so we won't be mislead by the metrics.
-        self.meta_cli
-            .set_local_task_checkpoint(&task, rts)
-            .await
-            .context(format_args!("on flushing task {}", task))?;
-
         // Currently, we only support one task at the same time,
         // so use the task as label would be ok.
         metrics::STORE_CHECKPOINT_TS
@@ -267,7 +271,7 @@ where
                 .get_local_task_checkpoint(&task)
                 .await
                 .context(format_args!(
-                    "during checking whether we should skip advencing ts to {}.",
+                    "during checking whether we should skip advancing ts to {}.",
                     rts
                 ))?;
             // if we need to roll back checkpoint ts, don't prevent it.
@@ -285,6 +289,12 @@ where
         {
             err.report("failed to upload region checkpoint");
         }
+        // we can advance the progress at next time.
+        // return early so we won't be mislead by the metrics.
+        self.meta_cli
+            .set_local_task_checkpoint(&task, rts)
+            .await
+            .context(format_args!("on flushing task {}", task))?;
         self.base.after(task, rts).await?;
         self.meta_cli
             .clear_region_checkpoint(&task, &self.fresh_regions)
@@ -295,14 +305,15 @@ where
 }
 
 pub struct CheckpointV3FlushObserver<S, O> {
-    sched: Scheduler<Task>,
-    meta_cli: MetadataClient<S>,
-    checkpoints: Vec<(Region, TimeStamp)>,
-    subs: SubscriptionTracer,
-
     /// We should modify the rts (the local rts isn't right.)
     /// This should be a BasicFlushObserver or something likewise.
     baseline: O,
+    sched: Scheduler<Task>,
+    meta_cli: MetadataClient<S>,
+    subs: SubscriptionTracer,
+
+    checkpoints: Vec<(Region, TimeStamp)>,
+    global_checkpoint_cache: HashMap<String, Checkpoint>,
 }
 
 impl<S, O> CheckpointV3FlushObserver<S, O> {
@@ -316,9 +327,30 @@ impl<S, O> CheckpointV3FlushObserver<S, O> {
             sched,
             meta_cli,
             checkpoints: vec![],
+            // We almost always have only one entry.
+            global_checkpoint_cache: HashMap::with_capacity(1),
             subs,
             baseline,
         }
+    }
+}
+
+impl<S, O> CheckpointV3FlushObserver<S, O>
+where
+    S: MetaStore + 'static,
+    O: FlushObserver + Send,
+{
+    async fn get_checkpoint(&mut self, task: &str) -> Result<Checkpoint> {
+        let cp = match self.global_checkpoint_cache.get(task) {
+            Some(cp) => *cp,
+            None => {
+                let global_checkpoint = self.meta_cli.global_checkpoint_of_task(task).await?;
+                self.global_checkpoint_cache
+                    .insert(task.to_owned(), global_checkpoint);
+                global_checkpoint
+            }
+        };
+        Ok(cp)
     }
 }
 
@@ -338,7 +370,7 @@ where
             &mut self.checkpoints,
         )));
         try_send!(self.sched, t);
-        let global_checkpoint = self.meta_cli.global_checkpoint_of_task(task).await?;
+        let global_checkpoint = self.get_checkpoint(task).await?;
         info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
         self.baseline
             .after(task, global_checkpoint.ts.into_inner())
@@ -348,13 +380,59 @@ where
 
     async fn rewrite_resolved_ts(&mut self, task: &str) -> Option<TimeStamp> {
         let global_checkpoint = self
-            .meta_cli
-            .global_checkpoint_of_task(task)
+            .get_checkpoint(task)
             .await
             .map_err(|err| err.report("failed to get resolved ts for rewriting"))
             .ok()?;
         info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
         matches!(global_checkpoint.provider, CheckpointProvider::Global)
             .then(|| global_checkpoint.ts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use kvproto::metapb::*;
+    use txn_types::TimeStamp;
+
+    use super::RegionIdWithVersion;
+    use crate::GetCheckpointResult;
+
+    fn region(id: u64, version: u64, conf_version: u64) -> Region {
+        let mut r = Region::new();
+        let mut e = RegionEpoch::new();
+        e.set_version(version);
+        e.set_conf_ver(conf_version);
+        r.set_id(id);
+        r.set_region_epoch(e);
+        r
+    }
+
+    #[test]
+    fn test_mgr() {
+        let mut mgr = super::CheckpointManager::default();
+        mgr.update_region_checkpoint(&region(1, 32, 8), TimeStamp::new(8));
+        mgr.update_region_checkpoint(&region(2, 34, 8), TimeStamp::new(15));
+        let r = mgr.get_from_region(RegionIdWithVersion::new(1, 32));
+        assert_matches::assert_matches!(r, GetCheckpointResult::Ok{checkpoint, ..} if checkpoint.into_inner() == 8);
+        let r = mgr.get_from_region(RegionIdWithVersion::new(2, 33));
+        assert_matches::assert_matches!(r, GetCheckpointResult::EpochNotMatch { .. });
+        let r = mgr.get_from_region(RegionIdWithVersion::new(3, 44));
+        assert_matches::assert_matches!(r, GetCheckpointResult::NotFound { .. });
+        mgr.update_region_checkpoint(&region(1, 30, 8), TimeStamp::new(16));
+        let r = mgr.get_from_region(RegionIdWithVersion::new(1, 32));
+        assert_matches::assert_matches!(r, GetCheckpointResult::Ok{checkpoint, ..} if checkpoint.into_inner() == 8);
+
+        mgr.update_region_checkpoint(&region(1, 30, 8), TimeStamp::new(16));
+        let r = mgr.get_from_region(RegionIdWithVersion::new(1, 32));
+        assert_matches::assert_matches!(r, GetCheckpointResult::Ok{checkpoint, ..} if checkpoint.into_inner() == 8);
+        mgr.update_region_checkpoint(&region(1, 32, 8), TimeStamp::new(16));
+        let r = mgr.get_from_region(RegionIdWithVersion::new(1, 32));
+        assert_matches::assert_matches!(r, GetCheckpointResult::Ok{checkpoint, ..} if checkpoint.into_inner() == 16);
+        mgr.update_region_checkpoint(&region(1, 33, 8), TimeStamp::new(24));
+        let r = mgr.get_from_region(RegionIdWithVersion::new(1, 33));
+        assert_matches::assert_matches!(r, GetCheckpointResult::Ok{checkpoint, ..} if checkpoint.into_inner() == 24);
     }
 }
