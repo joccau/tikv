@@ -722,10 +722,8 @@ impl StreamTaskInfo {
 
     async fn on_events_of_key(&self, key: TempFileKey, events: ApplyEvents) -> Result<()> {
         if let Some(f) = self.files.read().await.get(&key) {
-            self.total_size.fetch_add(
-                f.lock().await.on_events(events).await?,
-                Ordering::SeqCst,
-            );
+            self.total_size
+                .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
             return Ok(());
         }
 
@@ -742,10 +740,8 @@ impl StreamTaskInfo {
         }
 
         let f = w.get(&key).unwrap();
-        self.total_size.fetch_add(
-            f.lock().await.on_events(events).await?,
-            Ordering::SeqCst,
-        );
+        self.total_size
+            .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1137,10 +1133,7 @@ impl DataFile {
             // if value is empty, no need to decode begin_ts.
             if event.cf == CF_WRITE && event.value.len() > 0 {
                 let begin_ts = Self::decode_begin_ts(event.value)?;
-                self.min_begin_ts = Some(
-                    self.min_begin_ts
-                        .map_or(begin_ts, |ts| ts.min(begin_ts)),
-                );
+                self.min_begin_ts = Some(self.min_begin_ts.map_or(begin_ts, |ts| ts.min(begin_ts)));
             }
             self.number_of_entries += 1;
             self.file_size += size;
