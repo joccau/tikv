@@ -1131,7 +1131,7 @@ impl DataFile {
 
             // decode_begin_ts is used to maintain the txn when restore log.
             // if value is empty, no need to decode begin_ts.
-            if event.cf == CF_WRITE && event.value.len() > 0 {
+            if event.cf == CF_WRITE && !event.value.is_empty() {
                 let begin_ts = Self::decode_begin_ts(event.value)?;
                 self.min_begin_ts = Some(self.min_begin_ts.map_or(begin_ts, |ts| ts.min(begin_ts)));
             }
