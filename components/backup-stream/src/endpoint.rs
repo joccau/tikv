@@ -127,8 +127,8 @@ where
 
         let initial_scan_memory_quota =
             PendingMemoryQuota::new(config.initial_scan_pending_memory_quota.0 as _);
-        let limit = if config.initial_scan_rate_limit > 0 {
-            config.initial_scan_rate_limit as f64
+        let limit = if config.initial_scan_rate_limit.0 > 0 {
+            config.initial_scan_rate_limit.0 as f64
         } else {
             f64::INFINITY
         };
@@ -203,7 +203,7 @@ where
                 let safepoint = meta_cli.global_progress_of_task(&task).await?;
                 pdc.update_service_safe_point(
                     safepoint_name,
-                    TimeStamp::new(safepoint),
+                    TimeStamp::new(safepoint - 1),
                     safepoint_ttl,
                 )
                 .await?;
@@ -743,7 +743,7 @@ where
                 if let Err(err) = pd_cli
                     .update_service_safe_point(
                         format!("backup-stream-{}-{}", task, store_id),
-                        TimeStamp::new(rts),
+                        TimeStamp::new(rts - 1),
                         // Add a service safe point for 12 hour.
                         // It would probably be safe.
                         ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE).0,

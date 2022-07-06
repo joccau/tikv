@@ -42,7 +42,7 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
-use txn_types::{Key, Lock, TimeStamp};
+use txn_types::{Key, Lock, TimeStamp, WriteRef};
 
 use super::errors::Result;
 use crate::{
@@ -826,6 +826,11 @@ impl StreamTaskInfo {
 
     /// move need-flushing files to flushing_files.
     pub async fn move_to_flushing_files(&self) -> &Self {
+        // if flushing_files is not empty, which represents this flush is a retry operation.
+        if !self.flushing_files.read().await.is_empty() {
+            return self;
+        }
+
         let mut w = self.files.write().await;
         let mut fw = self.flushing_files.write().await;
         for (k, v) in w.drain() {
@@ -994,6 +999,7 @@ struct DataFile {
     min_ts: TimeStamp,
     max_ts: TimeStamp,
     resolved_ts: TimeStamp,
+    min_begin_ts: Option<TimeStamp>,
     sha256: Hasher,
     inner: BufWriter<File>,
     start_key: Vec<u8>,
@@ -1008,6 +1014,8 @@ struct DataFile {
 pub struct MetadataInfo {
     pub files: Vec<DataFileInfo>,
     pub min_resolved_ts: Option<u64>,
+    pub min_ts: Option<u64>,
+    pub max_ts: Option<u64>,
     pub store_id: u64,
 }
 
@@ -1016,6 +1024,8 @@ impl MetadataInfo {
         Self {
             files: Vec::with_capacity(cap),
             min_resolved_ts: None,
+            min_ts: None,
+            max_ts: None,
             store_id: 0,
         }
     }
@@ -1027,6 +1037,12 @@ impl MetadataInfo {
     fn push(&mut self, file: DataFileInfo) {
         let rts = file.resolved_ts;
         self.min_resolved_ts = self.min_resolved_ts.map_or(Some(rts), |r| Some(r.min(rts)));
+        self.min_ts = self
+            .min_ts
+            .map_or(Some(file.min_ts), |ts| Some(ts.min(file.min_ts)));
+        self.max_ts = self
+            .max_ts
+            .map_or(Some(file.max_ts), |ts| Some(ts.max(file.max_ts)));
         self.files.push(file);
     }
 
@@ -1034,7 +1050,9 @@ impl MetadataInfo {
         let mut metadata = Metadata::new();
         metadata.set_files(self.files.into());
         metadata.set_store_id(self.store_id as _);
-        metadata.set_resolved_ts(self.min_resolved_ts.unwrap_or_default() as _);
+        metadata.set_resolved_ts(self.min_resolved_ts.unwrap_or_default());
+        metadata.set_min_ts(self.min_ts.unwrap_or(0));
+        metadata.set_max_ts(self.max_ts.unwrap_or(0));
 
         metadata
             .write_to_bytes()
@@ -1060,6 +1078,7 @@ impl DataFile {
             min_ts: TimeStamp::max(),
             max_ts: TimeStamp::zero(),
             resolved_ts: TimeStamp::zero(),
+            min_begin_ts: None,
             inner: BufWriter::with_capacity(128 * 1024, File::create(local_path.as_ref()).await?),
             sha256,
             number_of_entries: 0,
@@ -1075,10 +1094,23 @@ impl DataFile {
         remove_file(&self.local_path).await
     }
 
+    fn decode_begin_ts(value: Vec<u8>) -> Result<TimeStamp> {
+        WriteRef::parse(&value).map_or_else(
+            |e| {
+                Err(Error::Other(box_err!(
+                    "failed to parse write cf value: {}",
+                    e
+                )))
+            },
+            |w| Ok(w.start_ts),
+        )
+    }
+
     /// Add a new KV pair to the file, returning its size.
     async fn on_events(&mut self, events: ApplyEvents) -> Result<usize> {
         let now = Instant::now_coarse();
         let mut total_size = 0;
+
         for mut event in events.events {
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
             let mut size = 0;
@@ -1096,6 +1128,13 @@ impl DataFile {
             self.min_ts = self.min_ts.min(ts);
             self.max_ts = self.max_ts.max(ts);
             self.resolved_ts = self.resolved_ts.max(events.region_resolved_ts.into());
+
+            // decode_begin_ts is used to maintain the txn when restore log.
+            // if value is empty, no need to decode begin_ts.
+            if event.cf == CF_WRITE && event.value.len() > 0 {
+                let begin_ts = Self::decode_begin_ts(event.value)?;
+                self.min_begin_ts = Some(self.min_begin_ts.map_or(begin_ts, |ts| ts.min(begin_ts)));
+            }
             self.number_of_entries += 1;
             self.file_size += size;
             self.update_key_bound(key.into_encoded());
@@ -1144,6 +1183,10 @@ impl DataFile {
         meta.set_max_ts(self.max_ts.into_inner() as _);
         meta.set_min_ts(self.min_ts.into_inner() as _);
         meta.set_resolved_ts(self.resolved_ts.into_inner() as _);
+        meta.set_min_begin_ts_in_default_cf(
+            self.min_begin_ts
+                .map_or(self.min_ts.into_inner(), |ts| ts.into_inner()),
+        );
         meta.set_start_key(std::mem::take(&mut self.start_key));
         meta.set_end_key(std::mem::take(&mut self.end_key));
         meta.set_length(self.file_size as _);
@@ -1188,6 +1231,7 @@ mod tests {
         codec::number::NumberEncoder,
         worker::{dummy_scheduler, ReceiverWrapper},
     };
+    use txn_types::{Write, WriteType};
 
     use super::*;
     use crate::utils;
@@ -1711,5 +1755,15 @@ mod tests {
         let s = TempFileKey::format_date_time(431656320867237891);
         let s = s.to_string();
         assert_eq!(s, "20220307");
+    }
+
+    #[test]
+    fn test_decode_begin_ts() {
+        let start_ts = TimeStamp::new(12345678);
+        let w = Write::new(WriteType::Put, start_ts, Some(b"short_value".to_vec()));
+        let value = w.as_ref().to_bytes();
+
+        let begin_ts = DataFile::decode_begin_ts(value).unwrap();
+        assert_eq!(begin_ts, start_ts);
     }
 }
