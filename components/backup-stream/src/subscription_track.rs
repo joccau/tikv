@@ -463,7 +463,7 @@ mod test {
     fn test_delay_remove() {
         let subs = SubscriptionTracer::default();
         let handle = ObserveHandle::new();
-        subs.register_region(&region(1, 1, 1), handle.clone(), Some(TimeStamp::new(42)));
+        subs.register_region(&region(1, 1, 1), handle, Some(TimeStamp::new(42)));
         assert!(subs.get_subscription_of(1).is_some());
         assert!(subs.is_observing(1));
         subs.deregister_region_if(&region(1, 1, 1), |_, _| true);

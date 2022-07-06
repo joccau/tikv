@@ -53,6 +53,36 @@ struct ScanCmd {
     work: Work,
 }
 
+/// The response of requesting resolve the new checkpoint of regions.
+pub struct ResolvedRegions {
+    items: Vec<(Region, TimeStamp)>,
+    checkpoint: TimeStamp,
+}
+
+impl ResolvedRegions {
+    /// compose the calculated global checkpoint and region checkpoints.
+    /// note: maybe we can compute the global checkpoint internal and getting the interface clear.
+    ///       however we must take the `min_ts` or we cannot provide valid global checkpoint if there
+    ///       isn't any region checkpoint.
+    pub fn new(checkpoint: TimeStamp, checkpoints: Vec<(Region, TimeStamp)>) -> Self {
+        Self {
+            items: checkpoints,
+            checkpoint,
+        }
+    }
+
+    /// take the region checkpoints from the structure.
+    pub fn take_region_checkpoints(&mut self) -> Vec<(Region, TimeStamp)> {
+        std::mem::take(&mut self.items)
+    }
+
+    /// get the global checkpoint.
+    pub fn global_checkpoint(&self) -> TimeStamp {
+        self.checkpoint
+    }
+}
+
+/// the abstraction over a "DB" which provides the initial scanning.
 trait InitialScan: Clone {
     fn do_initial_scan(
         &self,
@@ -195,7 +225,7 @@ const MESSAGE_BUFFER_SIZE: usize = 4096;
 /// The operator for region subscription.
 /// It make a queue for operations over the `SubscriptionTracer`, generally,
 /// we should only modify the `SubscriptionTracer` itself (i.e. insert records, remove records) at here.
-/// So the order subscription / unsubscription won't be broken.
+/// So the order subscription / desubscription won't be broken.
 pub struct RegionSubscriptionManager<S, R, PDC> {
     // Note: these fields appear everywhere, maybe make them a `context` type?
     regions: R,
@@ -363,7 +393,7 @@ where
                     let rts = min_region.map(|(_, rts)| *rts).unwrap_or(min_ts);
                     info!("getting checkpoint"; "defined_by_region" => ?min_region.map(|r| r.0.get_id()), "checkpoint" => %rts);
                     self.subs.warn_if_gap_too_huge(rts);
-                    callback(rts, cps);
+                    callback(ResolvedRegions::new(rts, cps));
                 }
             }
         }

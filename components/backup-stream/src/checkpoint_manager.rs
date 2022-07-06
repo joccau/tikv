@@ -1,13 +1,13 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use kvproto::{
     errorpb::{Error as PbError, *},
     metapb::Region,
 };
 use pd_client::PdClient;
-use tikv_util::{info, worker::Scheduler, config::ReadableDuration};
+use tikv_util::{config::ReadableDuration, info, worker::Scheduler};
 use txn_types::TimeStamp;
 
 use crate::{
@@ -23,11 +23,17 @@ use crate::{
 const CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE: u64 = 12;
 
 /// A manager for maintaining the last flush ts.
+/// This information is provided for the `advancer` in checkpoint V3,
+/// which involved a central node (typically TiDB) for collecting all regions' checkpoint
+/// then advancing the global checkpoint.
 #[derive(Debug, Default)]
 pub struct CheckpointManager {
     items: HashMap<u64, LastFlushTsOfRegion>,
 }
 
+/// The result of getting a checkpoint.
+/// The possibility of failed to getting checkpoint is pretty high:
+/// because there is a gap between region leader change and flushing.
 #[derive(Debug)]
 pub enum GetCheckpointResult {
     Ok {
@@ -111,7 +117,7 @@ impl CheckpointManager {
 
     /// get all checkpoints stored.
     pub fn get_all(&self) -> Vec<LastFlushTsOfRegion> {
-        self.items.values().map(|v| v.clone()).collect()
+        self.items.values().cloned().collect()
     }
 }
 
@@ -177,24 +183,19 @@ pub trait FlushObserver: Send + 'static {
     }
 }
 
-pub struct BasicFlushObserver<PD, S> {
+pub struct BasicFlushObserver<PD> {
     pd_cli: Arc<PD>,
-    meta_cli: MetadataClient<S>,
     store_id: u64,
 }
 
-impl<PD, S> BasicFlushObserver<PD, S> {
-    pub fn new(meta_cli: MetadataClient<S>, pd_cli: Arc<PD>, store_id: u64) -> Self {
-        Self {
-            pd_cli,
-            meta_cli,
-            store_id,
-        }
+impl<PD> BasicFlushObserver<PD> {
+    pub fn new(pd_cli: Arc<PD>, store_id: u64) -> Self {
+        Self { pd_cli, store_id }
     }
 }
 
 #[async_trait::async_trait]
-impl<PD: PdClient + 'static, S: MetaStore + 'static> FlushObserver for BasicFlushObserver<PD, S> {
+impl<PD: PdClient + 'static> FlushObserver for BasicFlushObserver<PD> {
     async fn before(&mut self, _checkpoints: Vec<(Region, TimeStamp)>) {}
 
     async fn after(&mut self, task: &str, rts: u64) -> Result<()> {
@@ -272,7 +273,7 @@ where
         if !self.can_advance.take().map(|f| f()).unwrap_or(true) {
             let cp_now = self
                 .meta_cli
-                .get_local_task_checkpoint(&task)
+                .get_local_task_checkpoint(task)
                 .await
                 .context(format_args!(
                     "during checking whether we should skip advancing ts to {}.",
@@ -288,7 +289,7 @@ where
         // Unless in some extreme condition, skipping upload the region checkpoint won't lead to data loss.
         if let Err(err) = self
             .meta_cli
-            .upload_region_checkpoint(&task, &self.checkpoints)
+            .upload_region_checkpoint(task, &self.checkpoints)
             .await
         {
             err.report("failed to upload region checkpoint");
@@ -296,12 +297,12 @@ where
         // we can advance the progress at next time.
         // return early so we won't be mislead by the metrics.
         self.meta_cli
-            .set_local_task_checkpoint(&task, rts)
+            .set_local_task_checkpoint(task, rts)
             .await
             .context(format_args!("on flushing task {}", task))?;
         self.base.after(task, rts).await?;
         self.meta_cli
-            .clear_region_checkpoint(&task, &self.fresh_regions)
+            .clear_region_checkpoint(task, &self.fresh_regions)
             .await
             .context(format_args!("on clearing the checkpoint for task {}", task))?;
         Ok(())

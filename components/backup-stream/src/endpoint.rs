@@ -25,6 +25,7 @@ use raftstore::{
 };
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
+    box_err,
     config::ReadableDuration,
     debug, defer, info,
     time::{Instant, Limiter},
@@ -42,6 +43,7 @@ use txn_types::TimeStamp;
 
 use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
+    annotate,
     checkpoint_manager::{
         BasicFlushObserver, CheckpointManager, CheckpointV2FlushObserver,
         CheckpointV3FlushObserver, FlushObserver, GetCheckpointResult, RegionIdWithVersion,
@@ -53,7 +55,7 @@ use crate::{
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
     router::{ApplyEvents, Router},
-    subscription_manager::RegionSubscriptionManager,
+    subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::SubscriptionTracer,
     try_send,
     utils::{self, CallbackWaitGroup, StopWatch, Work},
@@ -380,11 +382,7 @@ where
     }
 
     fn flush_observer(&self) -> Box<dyn FlushObserver> {
-        let basic = BasicFlushObserver::new(
-            self.meta_client.clone(),
-            self.pd_client.clone(),
-            self.store_id,
-        );
+        let basic = BasicFlushObserver::new(self.pd_client.clone(), self.store_id);
         if self.config.use_checkpoint_v3 {
             Box::new(CheckpointV3FlushObserver::new(
                 self.scheduler.clone(),
@@ -716,34 +714,36 @@ where
         }
     }
 
-    fn get_resolved_ts(&self, min_ts: TimeStamp) -> future![(TimeStamp, Vec<(Region, TimeStamp)>)] {
+    fn get_resolved_regions(&self, min_ts: TimeStamp) -> future![Result<ResolvedRegions>] {
         let (tx, rx) = oneshot::channel();
         let op = self.region_operator.clone();
         async move {
             let req = ObserveOp::ResolveRegions {
-                callback: Box::new(move |ts, cps| {
-                    let _ = tx.send((ts, cps));
+                callback: Box::new(move |rs| {
+                    let _ = tx.send(rs);
                 }),
                 min_ts,
             };
             op.request(req).await;
-            rx.await.expect("BUG: resolve regions dropped tx")
+            rx.await
+                .map_err(|err| annotate!(err, "failed to send request for resolve regions"))
         }
     }
 
     fn do_flush(&self, task: String, min_ts: TimeStamp) -> future![Result<()>] {
-        let get_rts = self.get_resolved_ts(min_ts);
+        let get_rts = self.get_resolved_regions(min_ts);
         let router = self.range_router.clone();
         let store_id = self.store_id;
         let mut flush_ob = self.flush_observer();
         async move {
-            let (mut new_rts, cps) = get_rts.await;
+            let mut resolved = get_rts.await?;
+            let mut new_rts = resolved.global_checkpoint();
             #[cfg(feature = "failpoints")]
             fail::fail_point!("delay_on_flush");
-            flush_ob.before(cps).await;
-            if let Some(new_new_rts) = flush_ob.rewrite_resolved_ts(&task).await {
-                info!("rewriting resolved ts"; "old" => %new_rts, "new" => %new_new_rts);
-                new_rts = new_new_rts.min(new_rts);
+            flush_ob.before(resolved.take_region_checkpoints()).await;
+            if let Some(rewritten_rts) = flush_ob.rewrite_resolved_ts(&task).await {
+                info!("rewriting resolved ts"; "old" => %new_rts, "new" => %rewritten_rts);
+                new_rts = rewritten_rts.min(new_rts);
             }
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
                 info!("flushing and refreshing checkpoint ts.";
@@ -789,7 +789,6 @@ where
     /// Modify observe over some region.
     /// This would register the region to the RaftStore.
     pub fn on_modify_observe(&self, op: ObserveOp) {
-        info!("backup stream: on_modify_observe"; "op" => ?op);
         self.pool.block_on(self.region_operator.request(op));
     }
 
@@ -954,6 +953,9 @@ pub enum TaskOp {
     ResumeTask(String),
 }
 
+/// The callback for resolving region.
+type ResolveRegionsCallback = Box<dyn FnOnce(ResolvedRegions) + 'static + Send>;
+
 pub enum ObserveOp {
     Start {
         region: Region,
@@ -977,7 +979,7 @@ pub enum ObserveOp {
         err: Box<Error>,
     },
     ResolveRegions {
-        callback: Box<dyn FnOnce(TimeStamp, Vec<(Region, TimeStamp)>) + 'static + Send>,
+        callback: ResolveRegionsCallback,
         min_ts: TimeStamp,
     },
 }
@@ -1002,9 +1004,10 @@ impl std::fmt::Debug for ObserveOp {
                 .field("handle", handle)
                 .field("err", err)
                 .finish(),
-            Self::ResolveRegions { .. } => f
+            Self::ResolveRegions { min_ts, .. } => f
                 .debug_struct("ResolveRegions")
-                .field("callback", &format_args!("fn (TimeStamp) -> {{ .. }}"))
+                .field("min_ts", min_ts)
+                .field("callback", &format_args!("fn {{ .. }}"))
                 .finish(),
         }
     }

@@ -30,11 +30,11 @@ fn id_of(region: &Region) -> RegionIdentity {
     id
 }
 
-impl Into<RegionIdentity> for RegionIdWithVersion {
-    fn into(self) -> RegionIdentity {
+impl From<RegionIdWithVersion> for RegionIdentity {
+    fn from(val: RegionIdWithVersion) -> Self {
         let mut id = RegionIdentity::new();
-        id.set_id(self.region_id);
-        id.set_epoch_version(self.region_epoch_version);
+        id.set_id(val.region_id);
+        id.set_epoch_version(val.region_epoch_version);
         id
     }
 }
