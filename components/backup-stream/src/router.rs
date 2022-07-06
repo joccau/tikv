@@ -1231,6 +1231,7 @@ mod tests {
         codec::number::NumberEncoder,
         worker::{dummy_scheduler, ReceiverWrapper},
     };
+    use txn_types::{Write, WriteType};
 
     use super::*;
     use crate::utils;
@@ -1754,5 +1755,15 @@ mod tests {
         let s = TempFileKey::format_date_time(431656320867237891);
         let s = s.to_string();
         assert_eq!(s, "20220307");
+    }
+
+    #[test]
+    fn test_decode_begin_ts() {
+        let start_ts = TimeStamp::new(12345678);
+        let w = Write::new(WriteType::Put, start_ts, Some(b"short_value".to_vec()));
+        let value = w.as_ref().to_bytes();
+
+        let begin_ts = DataFile::decode_begin_ts(value).unwrap();
+        assert_eq!(begin_ts, start_ts);
     }
 }
