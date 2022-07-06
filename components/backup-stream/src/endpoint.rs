@@ -134,8 +134,8 @@ where
 
         let initial_scan_memory_quota =
             PendingMemoryQuota::new(config.initial_scan_pending_memory_quota.0 as _);
-        let limit = if config.initial_scan_rate_limit > 0 {
-            config.initial_scan_rate_limit as f64
+        let limit = if config.initial_scan_rate_limit.0 > 0 {
+            config.initial_scan_rate_limit.0 as f64
         } else {
             f64::INFINITY
         };

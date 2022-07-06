@@ -7,7 +7,7 @@ use kvproto::{
     metapb::Region,
 };
 use pd_client::PdClient;
-use tikv_util::{info, worker::Scheduler};
+use tikv_util::{info, worker::Scheduler, config::ReadableDuration};
 use txn_types::TimeStamp;
 
 use crate::{

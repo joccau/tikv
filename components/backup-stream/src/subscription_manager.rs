@@ -22,7 +22,7 @@ use raftstore::{
     store::fsm::ChangeObserver,
 };
 use tikv::storage::Statistics;
-use tikv_util::{debug, info, time::Instant, warn, worker::Scheduler};
+use tikv_util::{box_err, debug, info, time::Instant, warn, worker::Scheduler};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use txn_types::TimeStamp;
 use yatp::task::callback::Handle as YatpHandle;
@@ -595,7 +595,8 @@ mod test {
     #[test]
     #[cfg(feature = "failpoints")]
     fn test_message_delay_and_exit() {
-        test_util::init_log_for_test();
+        use std::time::Duration;
+
         use super::ScanCmd;
 
         let pool = spawn_executors(NoopInitialScan, 1);
@@ -603,7 +604,7 @@ mod test {
         fail::cfg("execute_scan_command", "sleep(100)").unwrap();
         for _ in 0..100 {
             let wg = wg.clone();
-            pool.send(ScanCmd {
+            pool.request(ScanCmd {
                 region: Default::default(),
                 handle: Default::default(),
                 last_checkpoint: Default::default(),
