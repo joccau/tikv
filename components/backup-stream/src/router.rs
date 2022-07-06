@@ -723,7 +723,7 @@ impl StreamTaskInfo {
     async fn on_events_of_key(&self, key: TempFileKey, events: ApplyEvents) -> Result<()> {
         if let Some(f) = self.files.read().await.get(&key) {
             self.total_size.fetch_add(
-                f.lock().await.on_events(key.cf, events).await?,
+                f.lock().await.on_events(events).await?,
                 Ordering::SeqCst,
             );
             return Ok(());
@@ -743,7 +743,7 @@ impl StreamTaskInfo {
 
         let f = w.get(&key).unwrap();
         self.total_size.fetch_add(
-            f.lock().await.on_events(key.cf, events).await?,
+            f.lock().await.on_events(events).await?,
             Ordering::SeqCst,
         );
         Ok(())
@@ -1111,7 +1111,7 @@ impl DataFile {
     }
 
     /// Add a new KV pair to the file, returning its size.
-    async fn on_events(&mut self, cf: CfName, events: ApplyEvents) -> Result<usize> {
+    async fn on_events(&mut self, events: ApplyEvents) -> Result<usize> {
         let now = Instant::now_coarse();
         let mut total_size = 0;
 
@@ -1133,7 +1133,9 @@ impl DataFile {
             self.max_ts = self.max_ts.max(ts);
             self.resolved_ts = self.resolved_ts.max(events.region_resolved_ts.into());
 
-            if cf == CF_WRITE {
+            // decode_begin_ts is used to maintain the txn when restore log.
+            // if value is empty, no need to decode begin_ts.
+            if event.cf == CF_WRITE && event.value.len() > 0 {
                 let begin_ts = Self::decode_begin_ts(event.value)?;
                 self.min_begin_ts = Some(
                     self.min_begin_ts
