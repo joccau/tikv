@@ -583,6 +583,7 @@ where
     }
 }
 
+#[cfg(test)]
 mod test {
     use kvproto::metapb::Region;
     use tikv::storage::Statistics;
