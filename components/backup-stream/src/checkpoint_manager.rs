@@ -376,7 +376,7 @@ where
         )));
         try_send!(self.sched, t);
         let global_checkpoint = self.get_checkpoint(task).await?;
-        info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
+        info!("getting global checkpoint from cache for updating."; "checkpoint" => ?global_checkpoint);
         self.baseline
             .after(task, global_checkpoint.ts.into_inner())
             .await?;
