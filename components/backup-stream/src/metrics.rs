@@ -133,10 +133,9 @@ lazy_static! {
         "When gt 0, this node enabled streaming."
     )
     .unwrap();
-    pub static ref TRACK_REGION: IntCounterVec = register_int_counter_vec!(
+    pub static ref TRACK_REGION: IntGauge = register_int_gauge!(
         "tikv_stream_observed_region",
         "the region being observed by the current store.",
-        &["type"],
     )
     .unwrap();
     static ref TASK_STATUS: IntGaugeVec = register_int_gauge_vec!(

@@ -17,7 +17,10 @@ use super::{
         Snapshot, Subscription, Transaction, WithRevision,
     },
 };
-use crate::errors::{ContextualResultExt, Error, Result};
+use crate::{
+    debug,
+    errors::{ContextualResultExt, Error, Result},
+};
 
 /// Some operations over stream backup metadata key space.
 #[derive(Clone)]
@@ -74,6 +77,7 @@ pub enum CheckpointProvider {
     Store(u64),
     Region { id: u64, version: u64 },
     Task,
+    Global,
 }
 
 /// The polymorphic checkpoint.
@@ -128,6 +132,19 @@ impl Checkpoint {
                 ..,
             ] => Self::from_store_parse_result(id, checkpoint_ts)
                 .context(format_args!("during parsing key {}", path.display())),
+            [
+                // We always use '/' as the path.
+                // NOTE: Maybe just `split` and don't use `path`?
+                Some("/"),
+                Some("tidb"),
+                Some("br-stream"),
+                Some("checkpoint"),
+                Some(_task_name),
+                Some("central_global"),
+            ] => Ok(Self {
+                provider: CheckpointProvider::Global,
+                ts: TimeStamp::new(parse_ts_from_bytes(checkpoint_ts)?),
+            }),
             _ => Err(Error::MalformedMetadata(format!(
                 "cannot parse path {}(segs = {:?}) as checkpoint",
                 path.display(),
@@ -570,13 +587,8 @@ impl<Store: MetaStore> MetadataClient<Store> {
     /// Get the global checkpoint of a task.
     /// It is the smallest checkpoint of all types of checkpoint.
     pub async fn global_checkpoint_of_task(&self, task_name: &str) -> Result<Checkpoint> {
-        let cp = match self
-            .checkpoints_of(task_name)
-            .await?
-            .iter()
-            .min_by_key(|cp| cp.ts)
-        {
-            Some(cp) => *cp,
+        let cp = match self.global_checkpoint_of(task_name).await? {
+            Some(cp) => cp,
             None => self.get_task_start_ts_checkpoint(task_name).await?,
         };
         Ok(cp)
@@ -584,11 +596,9 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
     /// get the global progress (the min next_backup_ts among all stores).
     pub async fn global_progress_of_task(&self, task_name: &str) -> Result<u64> {
-        let ts = self
-            .global_checkpoint_of_task(task_name)
-            .await?
-            .ts
-            .into_inner();
+        let cp = self.global_checkpoint_of_task(task_name).await?;
+        debug!("getting global progress of task"; "checkpoint" => ?cp);
+        let ts = cp.ts.into_inner();
         Ok(ts)
     }
 
@@ -654,18 +664,35 @@ impl<Store: MetaStore> MetadataClient<Store> {
         self.meta_store.txn(txn).await
     }
 
+    pub async fn global_checkpoint_of(&self, task: &str) -> Result<Option<Checkpoint>> {
+        let cps = self.checkpoints_of(task).await?;
+        let mut min_checkpoint = None;
+        for cp in cps {
+            match cp.provider {
+                CheckpointProvider::Store(..) => {
+                    if min_checkpoint
+                        .as_ref()
+                        .map(|c: &Checkpoint| c.ts > cp.ts)
+                        .unwrap_or(true)
+                    {
+                        min_checkpoint = Some(cp);
+                    }
+                }
+                // The global checkpoint has higher priority than store checkpoint.
+                CheckpointProvider::Task | CheckpointProvider::Global => return Ok(Some(cp)),
+                CheckpointProvider::Region { .. } => continue,
+            }
+        }
+        Ok(min_checkpoint)
+    }
+
     pub async fn get_region_checkpoint(&self, task: &str, region: &Region) -> Result<Checkpoint> {
         let key = MetaKey::next_bakcup_ts_of_region(task, region);
         let s = self.meta_store.snapshot().await?;
         let r = s.get(Keys::Key(key.clone())).await?;
         match r.len() {
             0 => {
-                let global_cp = self
-                    .checkpoints_of(task)
-                    .await?
-                    .into_iter()
-                    .filter(|cp| !matches!(cp.provider, CheckpointProvider::Region { .. }))
-                    .min_by_key(|cp| cp.ts);
+                let global_cp = self.global_checkpoint_of(task).await?;
                 let cp = match global_cp {
                     None => self.get_task_start_ts_checkpoint(task).await?,
                     Some(cp) => cp,
@@ -718,7 +745,7 @@ mod test {
                     MetaKey::next_bakcup_ts_of_region("test", &r)
                 }
                 CheckpointProvider::Store(id) => MetaKey::next_backup_ts_of("test", id),
-                Task => unreachable!(),
+                _ => unreachable!(),
             };
             let checkpoint = c.checkpoint;
             let cp_bytes = checkpoint.to_be_bytes();

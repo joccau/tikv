@@ -1,6 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    collections::HashSet,
     fmt,
     marker::PhantomData,
     path::PathBuf,
@@ -24,6 +25,7 @@ use raftstore::{
 };
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
+    box_err,
     config::ReadableDuration,
     debug, defer, info,
     time::{Instant, Limiter},
@@ -41,44 +43,51 @@ use txn_types::TimeStamp;
 
 use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
-    errors::{ContextualResultExt, Error, Result},
+    annotate,
+    checkpoint_manager::{
+        BasicFlushObserver, CheckpointManager, CheckpointV2FlushObserver,
+        CheckpointV3FlushObserver, FlushObserver, GetCheckpointResult, RegionIdWithVersion,
+    },
+    errors::{Error, Result},
     event_loader::{InitialDataLoader, PendingMemoryQuota},
     future,
     metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
     router::{ApplyEvents, Router},
-    subscription_manager::RegionSubscriptionManager,
+    subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::SubscriptionTracer,
     try_send,
     utils::{self, CallbackWaitGroup, StopWatch, Work},
 };
 
 const SLOW_EVENT_THRESHOLD: f64 = 120.0;
-/// CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE specifies the safe point TTL(12 hour) for checkpoint-ts.
-/// If the checkpoint-ts advances, the safe-point of old checkpoint-ts will be overwrite by new one.
-const CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE: u64 = 12;
 /// CHECKPOINT_SAFEPOINT_TTL_IF_ERROR specifies the safe point TTL(24 hour) if task has fatal error.
 const CHECKPOINT_SAFEPOINT_TTL_IF_ERROR: u64 = 24;
 
 pub struct Endpoint<S, R, E, RT, PDC> {
-    meta_client: MetadataClient<S>,
+    // Note: those fields are more like a shared context between components.
+    // For now, we copied them everywhere, maybe we'd better extract them into a
+    // context type.
+    pub(crate) meta_client: MetadataClient<S>,
+    pub(crate) scheduler: Scheduler<Task>,
+    pub(crate) store_id: u64,
+    pub(crate) regions: R,
+    pub(crate) engine: PhantomData<E>,
+    pub(crate) router: RT,
+    pub(crate) pd_client: Arc<PDC>,
+    pub(crate) subs: SubscriptionTracer,
+    pub(crate) concurrency_manager: ConcurrencyManager,
+
     range_router: Router,
-    scheduler: Scheduler<Task>,
     observer: BackupStreamObserver,
     pool: Runtime,
-    store_id: u64,
-    regions: R,
-    engine: PhantomData<E>,
-    router: RT,
-    pd_client: Arc<PDC>,
-    subs: SubscriptionTracer,
-    concurrency_manager: ConcurrencyManager,
     initial_scan_memory_quota: PendingMemoryQuota,
     initial_scan_throughput_quota: Limiter,
     region_operator: RegionSubscriptionManager<S, R, PDC>,
     failover_time: Option<Instant>,
     config: BackupStreamConfig,
+    checkpoint_mgr: CheckpointManager,
 }
 
 impl<S, R, E, RT, PDC> Endpoint<S, R, E, RT, PDC>
@@ -170,6 +179,7 @@ where
             region_operator,
             failover_time: None,
             config,
+            checkpoint_mgr: Default::default(),
         }
     }
 }
@@ -371,6 +381,25 @@ where
         }
     }
 
+    fn flush_observer(&self) -> Box<dyn FlushObserver> {
+        let basic = BasicFlushObserver::new(self.pd_client.clone(), self.store_id);
+        if self.config.use_checkpoint_v3 {
+            Box::new(CheckpointV3FlushObserver::new(
+                self.scheduler.clone(),
+                self.meta_client.clone(),
+                self.subs.clone(),
+                basic,
+            ))
+        } else {
+            Box::new(CheckpointV2FlushObserver::new(
+                self.meta_client.clone(),
+                self.make_flush_guard(),
+                self.subs.clone(),
+                basic,
+            ))
+        }
+    }
+
     /// Convert a batch of events to the cmd batch, and update the resolver status.
     fn record_batch(subs: SubscriptionTracer, batch: CmdBatch) -> Option<ApplyEvents> {
         let region_id = batch.region_id;
@@ -518,6 +547,7 @@ where
         let cli = self.meta_client.clone();
         let init = self.make_initial_loader();
         let range_router = self.range_router.clone();
+        let use_v3 = self.config.use_checkpoint_v3;
 
         info!(
             "register backup stream task";
@@ -541,7 +571,9 @@ where
             let task_clone = task.clone();
             let run = async move {
                 let task_name = task.info.get_name();
-                cli.init_task(&task.info).await?;
+                if !use_v3 {
+                    cli.init_task(&task.info).await?;
+                }
                 let ranges = cli.ranges_of_task(task_name).await?;
                 info!(
                     "register backup stream ranges";
@@ -682,39 +714,37 @@ where
         }
     }
 
-    fn get_resolved_ts(&self, min_ts: TimeStamp) -> future![TimeStamp] {
+    fn get_resolved_regions(&self, min_ts: TimeStamp) -> future![Result<ResolvedRegions>] {
         let (tx, rx) = oneshot::channel();
         let op = self.region_operator.clone();
         async move {
             let req = ObserveOp::ResolveRegions {
-                callback: Box::new(move |ts| {
-                    let _ = tx.send(ts);
+                callback: Box::new(move |rs| {
+                    let _ = tx.send(rs);
                 }),
                 min_ts,
             };
             op.request(req).await;
-            rx.await.expect("BUG: resolve regions dropped tx")
+            rx.await
+                .map_err(|err| annotate!(err, "failed to send request for resolve regions"))
         }
     }
 
     fn do_flush(&self, task: String, min_ts: TimeStamp) -> future![Result<()>] {
+        let get_rts = self.get_resolved_regions(min_ts);
         let router = self.range_router.clone();
-        let meta_cli = self.meta_client.clone();
-        let pd_cli = self.pd_client.clone();
-        let resolvers = self.subs.clone();
-        let get_rts = self.get_resolved_ts(min_ts);
         let store_id = self.store_id;
-        let can_advance = self.make_flush_guard();
+        let mut flush_ob = self.flush_observer();
         async move {
-            let new_rts = get_rts.await;
+            let mut resolved = get_rts.await?;
+            let mut new_rts = resolved.global_checkpoint();
             #[cfg(feature = "failpoints")]
             fail::fail_point!("delay_on_flush");
-            let fresh_regions = resolvers.collect_fresh_subs();
-            let removal = resolvers.collect_removal_subs();
-            let checkpoints = removal
-                .into_iter()
-                .map(|sub| (sub.meta, sub.resolver.resolved_ts()))
-                .collect::<Vec<_>>();
+            flush_ob.before(resolved.take_region_checkpoints()).await;
+            if let Some(rewritten_rts) = flush_ob.rewrite_resolved_ts(&task).await {
+                info!("rewriting resolved ts"; "old" => %new_rts, "new" => %rewritten_rts);
+                new_rts = rewritten_rts.min(new_rts);
+            }
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
                 info!("flushing and refreshing checkpoint ts.";
                     "checkpoint_ts" => %rts,
@@ -724,56 +754,7 @@ where
                     // We cannot advance the resolved ts for now.
                     return Ok(());
                 }
-                if !can_advance() {
-                    let cp_now =
-                        meta_cli
-                            .get_local_task_checkpoint(&task)
-                            .await
-                            .context(format_args!(
-                                "during checking whether we should skip advencing ts to {}.",
-                                rts
-                            ))?;
-                    // if we need to roll back checkpoint ts, don't prevent it.
-                    if rts >= cp_now.into_inner() {
-                        info!("skipping advance checkpoint."; "rts" => %rts, "old_rts" => %cp_now);
-                        return Ok(());
-                    }
-                }
-
-                if let Err(err) = pd_cli
-                    .update_service_safe_point(
-                        format!("backup-stream-{}-{}", task, store_id),
-                        TimeStamp::new(rts - 1),
-                        // Add a service safe point for 12 hour.
-                        // It would probably be safe.
-                        ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_NOT_ADVANCE).0,
-                    )
-                    .await
-                {
-                    Error::from(err).report("failed to update service safe point!");
-                    // don't give up?
-                }
-                // Optionally upload the region checkpoint.
-                // Unless in some exteme condition, skipping upload the region checkpoint won't lead to data loss.
-                if let Err(err) = meta_cli.upload_region_checkpoint(&task, &checkpoints).await {
-                    err.report("failed to upload region checkpoint");
-                }
-                // we can advance the progress at next time.
-                // return early so we won't be mislead by the metrics.
-                meta_cli
-                    .set_local_task_checkpoint(&task, rts)
-                    .await
-                    .context(format_args!("on flushing task {}", task))?;
-
-                // Currently, we only support one task at the same time,
-                // so use the task as label would be ok.
-                metrics::STORE_CHECKPOINT_TS
-                    .with_label_values(&[task.as_str()])
-                    .set(rts as _);
-                meta_cli
-                    .clear_region_checkpoint(&task, fresh_regions.as_slice())
-                    .await
-                    .context(format_args!("on clearing the checkpoint for task {}", task))?;
+                flush_ob.after(&task, rts).await?
             }
             Ok(())
         }
@@ -792,6 +773,7 @@ where
     pub fn on_flush(&self, task: String) {
         self.pool.block_on(async move {
             let mts = self.prepare_min_ts().await;
+            info!("min_ts prepared for flushing"; "min_ts" => %mts);
             try_send!(self.scheduler, Task::FlushWithMinTs(task, mts));
         })
     }
@@ -807,7 +789,6 @@ where
     /// Modify observe over some region.
     /// This would register the region to the RaftStore.
     pub fn on_modify_observe(&self, op: ObserveOp) {
-        info!("backup stream: on_modify_observe"; "op" => ?op);
         self.pool.block_on(self.region_operator.request(op));
     }
 
@@ -842,6 +823,40 @@ where
             }
             Task::MarkFailover(t) => self.failover_time = Some(t),
             Task::FlushWithMinTs(task, min_ts) => self.on_flush_with_min_ts(task, min_ts),
+            Task::RegionCheckpointsOp(s) => self.handle_region_checkpoints_op(s),
+        }
+    }
+
+    pub fn handle_region_checkpoints_op(&mut self, op: RegionCheckpointOperation) {
+        match op {
+            RegionCheckpointOperation::Update(u) => {
+                // Let's clear all stale checkpoints first.
+                // Or they may slow down the global checkpoint.
+                self.checkpoint_mgr.clear();
+                for (region, checkpoint) in u {
+                    debug!("setting region checkpoint"; "region" => %region.get_id(), "ts" => %checkpoint);
+                    self.checkpoint_mgr
+                        .update_region_checkpoint(&region, checkpoint)
+                }
+            }
+            RegionCheckpointOperation::Get(g, cb) => {
+                let _guard = self.pool.handle().enter();
+                match g {
+                    RegionSet::Universal => cb(self
+                        .checkpoint_mgr
+                        .get_all()
+                        .into_iter()
+                        .map(|c| GetCheckpointResult::ok(c.region.clone(), c.checkpoint))
+                        .collect()),
+                    RegionSet::Regions(rs) => cb(rs
+                        .iter()
+                        .map(|(id, version)| {
+                            self.checkpoint_mgr
+                                .get_from_region(RegionIdWithVersion::new(*id, *version))
+                        })
+                        .collect()),
+                }
+            }
         }
     }
 
@@ -875,6 +890,28 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
         .build()
 }
 
+#[derive(Debug)]
+pub enum RegionSet {
+    /// The universal set.
+    Universal,
+    /// A subset.
+    Regions(HashSet<(u64, u64)>),
+}
+
+pub enum RegionCheckpointOperation {
+    Update(Vec<(Region, TimeStamp)>),
+    Get(RegionSet, Box<dyn FnOnce(Vec<GetCheckpointResult>) + Send>),
+}
+
+impl fmt::Debug for RegionCheckpointOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update(arg0) => f.debug_tuple("Update").field(arg0).finish(),
+            Self::Get(arg0, _) => f.debug_tuple("Get").field(arg0).finish(),
+        }
+    }
+}
+
 pub enum Task {
     WatchTask(TaskOp),
     BatchEvent(Vec<CmdBatch>),
@@ -904,6 +941,8 @@ pub enum Task {
     /// Execute the flush with the calculated `min_ts`.
     /// This is an internal command only issued by the `Flush` task.
     FlushWithMinTs(String, TimeStamp),
+    /// The command for getting region checkpoints.
+    RegionCheckpointsOp(RegionCheckpointOperation),
 }
 
 #[derive(Debug)]
@@ -913,6 +952,9 @@ pub enum TaskOp {
     PauseTask(String),
     ResumeTask(String),
 }
+
+/// The callback for resolving region.
+type ResolveRegionsCallback = Box<dyn FnOnce(ResolvedRegions) + 'static + Send>;
 
 pub enum ObserveOp {
     Start {
@@ -937,7 +979,7 @@ pub enum ObserveOp {
         err: Box<Error>,
     },
     ResolveRegions {
-        callback: Box<dyn FnOnce(TimeStamp) + 'static + Send>,
+        callback: ResolveRegionsCallback,
         min_ts: TimeStamp,
     },
 }
@@ -962,9 +1004,10 @@ impl std::fmt::Debug for ObserveOp {
                 .field("handle", handle)
                 .field("err", err)
                 .finish(),
-            Self::ResolveRegions { .. } => f
+            Self::ResolveRegions { min_ts, .. } => f
                 .debug_struct("ResolveRegions")
-                .field("callback", &format_args!("fn (TimeStamp) -> {{ .. }}"))
+                .field("min_ts", min_ts)
+                .field("callback", &format_args!("fn {{ .. }}"))
                 .finish(),
         }
     }
@@ -995,6 +1038,7 @@ impl fmt::Debug for Task {
                 .field(arg0)
                 .field(arg1)
                 .finish(),
+            Self::RegionCheckpointsOp(s) => f.debug_tuple("GetRegionCheckpoints").field(s).finish(),
         }
     }
 }
@@ -1030,6 +1074,7 @@ impl Task {
             Task::Sync(..) => "sync",
             Task::MarkFailover(_) => "mark_failover",
             Task::FlushWithMinTs(..) => "flush_with_min_ts",
+            Task::RegionCheckpointsOp(..) => "get_checkpoints",
         }
     }
 }

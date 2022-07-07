@@ -1131,7 +1131,7 @@ impl DataFile {
 
             // decode_begin_ts is used to maintain the txn when restore log.
             // if value is empty, no need to decode begin_ts.
-            if event.cf == CF_WRITE && event.value.len() > 0 {
+            if event.cf == CF_WRITE && !event.value.is_empty() {
                 let begin_ts = Self::decode_begin_ts(event.value)?;
                 self.min_begin_ts = Some(self.min_begin_ts.map_or(begin_ts, |ts| ts.min(begin_ts)));
             }
@@ -1292,7 +1292,8 @@ mod tests {
 
         fn put_table(&mut self, cf: &'static str, table: i64, key: &[u8], value: &[u8]) {
             let table_key = make_table_key(table, key);
-            self.put_event(cf, table_key, value.to_vec());
+            let val = Write::new(WriteType::Put, TimeStamp::new(42), Some(value.to_owned()));
+            self.put_event(cf, table_key, val.as_ref().to_bytes());
         }
 
         fn delete_table(&mut self, cf: &'static str, table: i64, key: &[u8]) {
@@ -1415,7 +1416,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_file() -> Result<()> {
-        test_util::init_log_for_test();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&tmp).await?;
         let (tx, rx) = dummy_scheduler();
@@ -1636,9 +1636,8 @@ mod tests {
                 .is_none()
         );
         check_on_events_result(&router.on_events(build_kv_event(10, 10)).await);
-        let _ = router.do_flush("error_prone", 42, TimeStamp::max()).await;
-        let t = router.get_task_info("error_prone").await.unwrap();
-        assert_eq!(t.total_size(), 0);
+        let t = router.do_flush("error_prone", 42, TimeStamp::max()).await;
+        assert!(t.is_some());
         Ok(())
     }
 
@@ -1670,7 +1669,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_when_stop() -> Result<()> {
-        test_util::init_log_for_test();
         let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         let router = Arc::new(RouterInner::new(

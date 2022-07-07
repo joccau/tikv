@@ -22,7 +22,7 @@ use raftstore::{
     store::fsm::ChangeObserver,
 };
 use tikv::storage::Statistics;
-use tikv_util::{debug, info, time::Instant, warn, worker::Scheduler};
+use tikv_util::{box_err, debug, info, time::Instant, warn, worker::Scheduler};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use txn_types::TimeStamp;
 use yatp::task::callback::Handle as YatpHandle;
@@ -33,7 +33,7 @@ use crate::{
     errors::{Error, Result},
     event_loader::InitialDataLoader,
     future,
-    metadata::{store::MetaStore, MetadataClient},
+    metadata::{store::MetaStore, CheckpointProvider, MetadataClient},
     metrics,
     observer::BackupStreamObserver,
     router::Router,
@@ -53,6 +53,36 @@ struct ScanCmd {
     work: Work,
 }
 
+/// The response of requesting resolve the new checkpoint of regions.
+pub struct ResolvedRegions {
+    items: Vec<(Region, TimeStamp)>,
+    checkpoint: TimeStamp,
+}
+
+impl ResolvedRegions {
+    /// compose the calculated global checkpoint and region checkpoints.
+    /// note: maybe we can compute the global checkpoint internal and getting the interface clear.
+    ///       however we must take the `min_ts` or we cannot provide valid global checkpoint if there
+    ///       isn't any region checkpoint.
+    pub fn new(checkpoint: TimeStamp, checkpoints: Vec<(Region, TimeStamp)>) -> Self {
+        Self {
+            items: checkpoints,
+            checkpoint,
+        }
+    }
+
+    /// take the region checkpoints from the structure.
+    pub fn take_region_checkpoints(&mut self) -> Vec<(Region, TimeStamp)> {
+        std::mem::take(&mut self.items)
+    }
+
+    /// get the global checkpoint.
+    pub fn global_checkpoint(&self) -> TimeStamp {
+        self.checkpoint
+    }
+}
+
+/// the abstraction over a "DB" which provides the initial scanning.
 trait InitialScan: Clone {
     fn do_initial_scan(
         &self,
@@ -195,7 +225,7 @@ const MESSAGE_BUFFER_SIZE: usize = 4096;
 /// The operator for region subscription.
 /// It make a queue for operations over the `SubscriptionTracer`, generally,
 /// we should only modify the `SubscriptionTracer` itself (i.e. insert records, remove records) at here.
-/// So the order subscription / unsubscription won't be broken.
+/// So the order subscription / desubscription won't be broken.
 pub struct RegionSubscriptionManager<S, R, PDC> {
     // Note: these fields appear everywhere, maybe make them a `context` type?
     regions: R,
@@ -357,9 +387,13 @@ where
                         warn!("waiting for initial scanning done timed out, forcing progress(with risk of data loss)!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
-                    let rts = self.subs.resolve_with(min_ts);
+                    let cps = self.subs.resolve_with(min_ts);
+                    let min_region = cps.iter().min_by_key(|(_, rts)| rts);
+                    // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
+                    let rts = min_region.map(|(_, rts)| *rts).unwrap_or(min_ts);
+                    info!("getting checkpoint"; "defined_by_region" => ?min_region.map(|r| r.0.get_id()), "checkpoint" => %rts);
                     self.subs.warn_if_gap_too_huge(rts);
-                    callback(rts);
+                    callback(ResolvedRegions::new(rts, cps));
                 }
             }
         }
@@ -421,6 +455,10 @@ where
             }
 
             Some(for_task) => {
+                #[cfg(feature = "failpoints")]
+                fail::fail_point!("try_start_observe", |_| {
+                    Err(Error::Other(box_err!("Nature is boring")))
+                });
                 let tso = self.get_last_checkpoint_of(&for_task, region).await?;
                 self.observe_over_with_initial_data_from_checkpoint(region, tso, handle.clone());
             }
@@ -431,6 +469,7 @@ where
     async fn start_observe(&self, region: Region) {
         let handle = ObserveHandle::new();
         if let Err(err) = self.try_start_observe(&region, handle.clone()).await {
+            warn!("failed to start observe, retrying"; "err" => %err);
             try_send!(
                 self.scheduler,
                 Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
@@ -473,14 +512,18 @@ where
             metrics::SKIP_RETRY.with_label_values(&["not-leader"]).inc();
             return Ok(());
         }
+        // Note: we may fail before we insert the region info to the subscription map.
+        // At that time, the command isn't steal and we should retry it.
+        let mut exists = false;
         let removed = self.subs.deregister_region_if(&region, |old, _| {
+            exists = true;
             let should_remove = old.handle().id == handle.id;
             if !should_remove {
                 warn!("stale retry command"; "region" => ?region, "handle" => ?handle, "old_handle" => ?old.handle());
             }
             should_remove
         });
-        if !removed {
+        if !removed && exists {
             metrics::SKIP_RETRY
                 .with_label_values(&["stale-command"])
                 .inc();
@@ -497,6 +540,11 @@ where
         let meta_cli = self.meta_cli.clone();
         let cp = meta_cli.get_region_checkpoint(task, region).await?;
         info!("got region checkpoint"; "region_id" => %region.get_id(), "checkpoint" => ?cp);
+        if matches!(cp.provider, CheckpointProvider::Global) {
+            metrics::STORE_CHECKPOINT_TS
+                .with_label_values(&[task])
+                .set(cp.ts.into_inner() as _);
+        }
         Ok(cp.ts)
     }
 
@@ -535,6 +583,7 @@ where
     }
 }
 
+#[cfg(test)]
 mod test {
     use kvproto::metapb::Region;
     use tikv::storage::Statistics;
@@ -577,7 +626,8 @@ mod test {
     #[test]
     #[cfg(feature = "failpoints")]
     fn test_message_delay_and_exit() {
-        test_util::init_log_for_test();
+        use std::time::Duration;
+
         use super::ScanCmd;
 
         let pool = spawn_executors(NoopInitialScan, 1);
@@ -585,7 +635,7 @@ mod test {
         fail::cfg("execute_scan_command", "sleep(100)").unwrap();
         for _ in 0..100 {
             let wg = wg.clone();
-            pool.send(ScanCmd {
+            pool.request(ScanCmd {
                 region: Default::default(),
                 handle: Default::default(),
                 last_checkpoint: Default::default(),
