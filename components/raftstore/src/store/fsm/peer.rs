@@ -2479,7 +2479,7 @@ where
             ExtraMessageType::MsgHibernateResponse => {
                 self.on_hibernate_response(msg.get_from_peer());
             }
-            ExtraMessageType::MsgRejectRaftLogCausedByMemoryUsage => todo!()
+            ExtraMessageType::MsgRejectRaftLogCausedByMemoryUsage => todo!(),
         }
     }
 
