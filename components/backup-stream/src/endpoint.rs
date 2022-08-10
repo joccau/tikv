@@ -258,7 +258,7 @@ where
             // check every 5s.
             // TODO: maybe use global timer handle in the `tikv_utils::timer` (instead of
             // enabling timing in the current runtime)?
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             debug!("backup stream trigger flush tick");
             router.tick().await;
         }
@@ -812,7 +812,9 @@ where
 
     fn on_update_global_checkpoint(&self, task: String) {
         self.pool.block_on(async move {
+            info!("backup stream enter block");
             let ts = self.meta_client.global_progress_of_task(&task).await;
+            info!("backup stream global_progress_of_task finish");
             match ts {
                 Ok(global_checkpoint) => {
                     let r = self
@@ -821,6 +823,10 @@ where
                         .await;
                     match r {
                         Ok(true) => {
+                            warn!("backup stream prepare set global checkpoint.";
+                                "task" => ?task,
+                                "global-checkpoint" => global_checkpoint,
+                            );
                             if let Err(err) = self
                                 .meta_client
                                 .set_storage_checkpoint(&task, global_checkpoint)
@@ -834,7 +840,7 @@ where
                             }
                         }
                         Ok(false) => {
-                            debug!("backup stream no need update global checkpoint.";
+                            info!("backup stream no need update global checkpoint.";
                                 "task" => ?task,
                                 "global-checkpoint" => global_checkpoint,
                             );

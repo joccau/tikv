@@ -494,6 +494,7 @@ impl RouterInner {
                 });
             }
         };
+        info!("backup stream get task info"; "task_info" => ?task_info);
         Ok(task_info)
     }
 
