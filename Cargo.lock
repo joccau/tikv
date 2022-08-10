@@ -84,7 +84,7 @@ dependencies = [
  "codec",
  "engine_traits",
  "kvproto",
- "match_template",
+ "match-template",
  "panic_hook",
  "thiserror",
  "tikv_alloc",
@@ -459,6 +459,7 @@ dependencies = [
  "fail",
  "file_system",
  "futures 0.3.15",
+ "futures-io",
  "grpcio",
  "hex 0.4.2",
  "kvproto",
@@ -732,6 +733,7 @@ dependencies = [
  "parking_lot 0.12.0",
  "pd_client",
  "prometheus",
+ "prometheus-static-metric",
  "raft",
  "raftstore",
  "serde",
@@ -1503,6 +1505,7 @@ version = "0.1.0"
 dependencies = [
  "engine_rocks",
  "engine_test",
+ "engine_traits",
  "fail",
  "futures 0.3.15",
  "keys",
@@ -2852,8 +2855,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e88c3cbe8288f77f293e48a28b3232e3defd203a6d839fa7f68ea4329e83464"
 
 [[package]]
-name = "match_template"
+name = "match-template"
 version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c334ac67725febd94c067736ac46ef1c7cacf1c743ca14b9f917c2df2c20acd8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3672,18 +3677,18 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ad3879ad3baf4e44784bc6a718a8698867bb991f8ce24d1bcbe2cfb4c3a75e"
+checksum = "78203e83c48cffbe01e4a2d35d566ca4de445d79a85372fc64e378bfc812a260"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744b6f092ba29c3650faf274db506afd39944f48420f6c86b17cfe0ee1cb36bb"
+checksum = "710faf75e1b33345361201d36d04e98ac1ed8909151a017ed384700836104c74"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4179,12 +4184,15 @@ dependencies = [
  "batch-system",
  "collections",
  "crossbeam",
+ "engine_rocks",
  "engine_test",
  "engine_traits",
  "error_code",
  "fail",
  "futures-util",
+ "keys",
  "kvproto",
+ "log_wrappers",
  "pd_client",
  "raft",
  "raft-proto",
@@ -4195,7 +4203,10 @@ dependencies = [
  "tempfile",
  "test_pd",
  "test_util",
+ "tikv_kv",
  "tikv_util",
+ "time",
+ "txn_types",
 ]
 
 [[package]]
@@ -5827,7 +5838,7 @@ dependencies = [
 name = "tidb_query_aggr"
 version = "0.0.1"
 dependencies = [
- "match_template",
+ "match-template",
  "panic_hook",
  "tidb_query_codegen",
  "tidb_query_common",
@@ -5886,7 +5897,7 @@ dependencies = [
  "kvproto",
  "lazy_static",
  "log_wrappers",
- "match_template",
+ "match-template",
  "nom 5.1.0",
  "num 0.3.0",
  "num-derive",
@@ -5918,7 +5929,7 @@ dependencies = [
  "itertools",
  "kvproto",
  "log_wrappers",
- "match_template",
+ "match-template",
  "protobuf",
  "slog",
  "slog-global",
@@ -5947,7 +5958,7 @@ dependencies = [
  "flate2",
  "hex 0.4.2",
  "log_wrappers",
- "match_template",
+ "match-template",
  "num 0.3.0",
  "num-traits",
  "openssl",
@@ -6024,7 +6035,7 @@ dependencies = [
  "libloading",
  "log",
  "log_wrappers",
- "match_template",
+ "match-template",
  "memory_trace_macros",
  "mime",
  "more-asserts",
@@ -6213,6 +6224,7 @@ dependencies = [
  "backtrace",
  "engine_panic",
  "engine_rocks",
+ "engine_test",
  "engine_traits",
  "error_code",
  "fail",
