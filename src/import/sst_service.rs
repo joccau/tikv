@@ -450,8 +450,17 @@ where
             let meta = req.get_meta();
 
             let result = (|| -> Result<()> {
+                let begin = Instant::now_coarse();
                 let temp_file =
                     importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
+                let temp_file_clone = temp_file.clone().into_os_string();
+                info!(
+                    "time cost: download cost";
+                    "path" => ?temp_file_clone,
+                    "takes" => ?begin.saturating_elapsed()
+                );
+                let begin = Instant::now_coarse();
+
                 let mut reqs = RequestCollector::from_cf(meta.get_cf());
                 let mut cmd_reqs = vec![];
                 let mut build_req_fn = build_apply_request(
@@ -471,6 +480,14 @@ where
                     &mut build_req_fn,
                 )?;
                 drop(build_req_fn);
+                info!(
+                    "time cost: rewrite kv cost";
+                    "path" => ?temp_file_clone,
+                    "takes" => ?begin.saturating_elapsed()
+                );
+                let begin = Instant::now_coarse();
+
+
                 if !reqs.is_empty() {
                     let cmd = make_request(&mut reqs, context);
                     cmd_reqs.push(cmd);
@@ -490,6 +507,11 @@ where
                 if let Some(r) = range {
                     apply_resp.set_range(r);
                 }
+                info!(
+                    "time cost: apply kv cost";
+                    "path" => ?temp_file_clone,
+                    "takes" => ?begin.saturating_elapsed()
+                );
                 Ok(())
             })();
             if let Err(e) = result {
