@@ -436,6 +436,7 @@ where
         let router = self.router.clone();
         let limiter = self.limiter.clone();
         let start = Instant::now();
+        let mut start_apply= Instant::now();
         let raft_size = self.raft_entry_max_size;
 
         let handle_task = async move {
@@ -478,7 +479,10 @@ where
                     let cmd = make_request(&mut reqs, context);
                     cmd_reqs.push(cmd);
                     info!("apply req"; "size" => req_size);
+                    IMPORTER_APPLY_BYTES.observe(req_size as _);
                 }
+
+                start_apply = Instant::now();
                 for cmd in cmd_reqs {
                     let (cb, future) = paired_future_callback();
                     match router.send_command(cmd, Callback::write(cb), RaftCmdExtraOpts::default())
@@ -525,8 +529,12 @@ where
             }));
             // Records how long the apply task waits to be scheduled.
             sst_importer::metrics::IMPORTER_APPLY_DURATION
+                .with_label_values(&["apply"])
+                .observe(start_apply.saturating_elapsed().as_secs_f64());
+            sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["finish"])
                 .observe(start.saturating_elapsed().as_secs_f64());
+                
             debug!("finished apply kv file with {:?}", resp);
             crate::send_rpc_response!(resp, sink, label, timer);
         };
@@ -998,6 +1006,7 @@ where
         // build the request and add it to a batch.
         if *req_size + req.compute_size() as u64 > raft_size {
             info!("apply req"; "size" => *req_size);
+            IMPORTER_APPLY_BYTES.observe(*req_size as _);
             *req_size = 0;
             let cmd = make_request(reqs, context.clone());
             cmd_reqs.push(cmd);
