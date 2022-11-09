@@ -450,8 +450,11 @@ where
             let meta = req.get_meta();
 
             let result = (|| -> Result<()> {
-                let temp_file =
-                    importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
+                let ext_storage = {
+                    let inner = importer.create_external_storage(req.get_storage_backend(), false)?;
+                    Arc::new(inner)
+                };
+                let buff = importer.do_read_kv_file(&meta, ext_storage, &limiter)?;
                 let mut reqs = RequestCollector::from_cf(meta.get_cf());
                 let mut cmd_reqs = vec![];
                 let mut build_req_fn = build_apply_request(
@@ -466,7 +469,7 @@ where
                     meta.get_start_key(),
                     meta.get_end_key(),
                     meta.get_restore_ts(),
-                    temp_file,
+                    buff,
                     req.get_rewrite_rule(),
                     &mut build_req_fn,
                 )?;
@@ -520,6 +523,7 @@ where
                 resp
             }));
             // Records how long the apply task waits to be scheduled.
+            importer.clear_kv_buff(&meta);
             sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["finish"])
                 .observe(start.saturating_elapsed().as_secs_f64());
