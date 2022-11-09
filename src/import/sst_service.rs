@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     future::Future,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex}, time::Duration, thread::sleep,
 };
 
 use collections::HashSet;
@@ -93,6 +93,20 @@ where
             .create()
             .unwrap();
         importer.start_switch_mode_check(&threads, engine.clone());
+
+        let thread = ThreadPoolBuilder::new()
+            .pool_size(cfg.num_threads)
+            .name_prefix("sst-importer")
+            .after_start_wrapper(move || {
+                tikv_alloc::add_thread_memory_accessor();
+                set_io_type(IoType::Import);
+            })
+            .before_stop_wrapper(move || tikv_alloc::remove_thread_memory_accessor())
+            .create()
+            .unwrap();
+
+        thread.spawn_ok(Self::tick(importer.clone()));
+
         ImportSstService {
             cfg,
             engine,
@@ -102,6 +116,13 @@ where
             limiter: Limiter::new(f64::INFINITY),
             task_slots: Arc::new(Mutex::new(HashSet::default())),
             raft_entry_max_size,
+        }
+    }
+
+    async fn tick(importer: Arc<SstImporter>){
+        loop {
+            sleep(Duration::from_secs(5));
+            importer.clear_cache_by_tick();
         }
     }
 

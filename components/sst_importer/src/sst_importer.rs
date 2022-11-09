@@ -6,7 +6,7 @@ use std::{
     io,
     ops::Bound,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::Arc, time::Duration,
 };
 
 use dashmap::DashMap;
@@ -50,7 +50,7 @@ pub struct SstImporter {
     // TODO: lift api_version as a type parameter.
     api_version: ApiVersion,
     compression_types: HashMap<CfName, SstCompressionType>,
-    file_locks: Arc<DashMap<String, (Arc<Vec<u8>>, u64)>>,
+    file_locks: Arc<DashMap<String, (Arc<Vec<u8>>, u64, Instant)>>,
 }
 
 impl SstImporter {
@@ -81,6 +81,14 @@ impl SstImporter {
         } else {
             self.compression_types.remove(cf_name);
         }
+    }
+
+    pub fn clear_cache_by_tick(&self){
+        info!("clear cache by tick");
+        self.file_locks
+        .retain(|_, (v, refcnt, start)|{
+            *refcnt > 0 as u64 || start.saturating_elapsed() < Duration::from_secs(180)
+        })
     }
 
     pub fn start_switch_mode_check<E: KvEngine>(&self, executor: &ThreadPool, db: E) {
@@ -297,9 +305,8 @@ impl SstImporter {
 
     pub fn clear_kv_buff(&self, meta: &KvMeta) {
         let dst_name = format!("{}_{}", meta.get_name(), meta.get_range_offset());
-        self.file_locks.remove_if_mut(&dst_name, |_, v| {
-            v.1 -= 1;
-            v.1 == 0 as u64
+        self.file_locks.entry(dst_name).and_modify(|v|{
+           v.1 -= 1; 
         });
     }
 
@@ -312,7 +319,7 @@ impl SstImporter {
         let start = Instant::now();
         let dst_name = format!("{}_{}", meta.get_name(), meta.get_range_offset());
 
-        let mut lock = self.file_locks.entry(dst_name).or_default();
+        let mut lock = self.file_locks.entry(dst_name).or_insert((Arc::default(), 1, Instant::now()));
         let v = lock.value_mut();
         if v.0.len() > 0 {
             v.1 += 1;
@@ -346,7 +353,7 @@ impl SstImporter {
             speed_limiter,
             restore_config,
         )?;
-        *lock = (Arc::new(buff), 1);
+        *lock = (Arc::new(buff), 1, Instant::now());
 
         IMPORTER_DOWNLOAD_BYTES.observe(file_length as _);
         IMPORTER_APPLY_DURATION
@@ -445,7 +452,7 @@ impl SstImporter {
             return Ok(path.save);
         }
 
-        let lock = self.file_locks.entry(dst_name.to_string()).or_default();
+        let lock = self.file_locks.entry(dst_name.clone()).or_insert((Arc::default(), 1, Instant::now()));
 
         if path.save.exists() {
             return Ok(path.save);
