@@ -41,7 +41,7 @@ use tikv_util::{
     sys::thread::ThreadBuildWrapper,
     time::{Instant, Limiter},
 };
-use txn_types::{Key, WriteRef, WriteType};
+use txn_types::{Key, WriteRef, WriteType, TimeStamp};
 
 use super::make_rpc_error;
 use crate::{import::duplicate_detect::DuplicateDetector, server::CONFIG_ROCKSDB_GAUGE};
@@ -1044,6 +1044,12 @@ where
         if k.is_empty() || (!is_delete && v.is_empty()) {
             info!("skip the invalid kv event"; "key" => log_wrappers::Value::key(&k), "value-len" => v.len());
             return;
+        }
+        
+        let ts = Key::decode_ts_from(&k).unwrap();
+        if ts.into_inner() == 437847182506459147 || ts.into_inner() == 437847171456827401 {
+            info!("apply kv"; "key" => log_wrappers::Value::key(&k), "value" => log_wrappers::Value::value(&v), 
+                "cf" => cf, "is_delete" => is_delete);
         }
 
         let mut req = Request::default();
