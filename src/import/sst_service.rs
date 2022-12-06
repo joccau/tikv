@@ -542,6 +542,20 @@ where
 
                 start_apply = Instant::now();
                 for cmd in cmd_reqs {
+                    let reqs = cmd.get_requests();
+                    for req in reqs {
+                        if req.get_cmd_type() == CmdType::Put {
+                            let put = req.get_put();
+                            let key = put.get_key();
+                            let ts = Key::decode_ts_from(&key).unwrap();
+                            if ts.into_inner() == 437847182506459147 || ts.into_inner() == 437847171456827401 {
+                                info!("apply kv into raft cmd"; "key" => log_wrappers::Value::key(key), 
+                                "commit-ts" => ts, "value" => log_wrappers::Value::value(put.get_value()), 
+                                "cf" => put.get_cf());
+                            }
+                        }
+                    }
+
                     let (cb, future) = paired_future_callback();
                     match router.send_command(cmd, Callback::write(cb), RaftCmdExtraOpts::default())
                     {
@@ -1117,6 +1131,7 @@ mod test {
 
     use engine_traits::{CF_DEFAULT, CF_WRITE};
     use kvproto::{kvrpcpb::Context, raft_cmdpb::*};
+    use regex::Match;
     use txn_types::{Key, TimeStamp, Write, WriteType};
 
     use crate::import::sst_service::{
@@ -1350,5 +1365,15 @@ mod test {
         });
         assert_eq!(reqs, reqs_result);
         assert_eq!(request_collector.is_empty(), true);
+    }
+
+    #[test]
+    fn test_or(){
+        let r = matches!(WriteType::Put, WriteType::Put | WriteType::Delete);
+        assert_eq!(r, true);
+        let r = matches!(WriteType::Delete, WriteType::Put | WriteType::Delete);
+        assert_eq!(r, true);
+        let r = matches!(WriteType::Lock, WriteType::Put | WriteType::Delete);
+        assert_eq!(r, false);
     }
 }
