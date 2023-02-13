@@ -107,6 +107,7 @@ pub enum CacheKvFile {
 }
 
 /// Remote presents a "remote" object which can be downloaded and then cached.
+/// The remote object should generally implement the `ShareOwned` trait.
 /// This structure doesn't manage how it is downloaded, it just manages the
 /// state. You need to provide the manually downloaded data to the
 /// [`DownloadPromise`].
@@ -128,6 +129,9 @@ pub enum CacheKvFile {
 #[derive(Clone, Debug)]
 pub struct Remote<T>(Arc<(Mutex<FileCacheInner<T>>, Condvar)>);
 
+/// When holding this, the holder has promised to downloading the remote object
+/// into local, then provide it to others waiting the object, by
+/// [`Self::fulfill()`].
 pub struct DownloadPromise<T>(Arc<(Mutex<FileCacheInner<T>>, Condvar)>);
 
 impl<T> DownloadPromise<T> {
@@ -154,8 +158,8 @@ impl<T> Drop for DownloadPromise<T> {
 
 impl<T> Remote<T> {
     /// create a downloading remote object.
-    /// it returns the handle to the remote object and a [DownloadPromise], the
-    /// latter can be used to fulfill the remote object.
+    /// it returns the handle to the remote object and a [`DownloadPromise`],
+    /// the latter can be used to fulfill the remote object.
     ///
     /// # Examples
     /// ```
@@ -633,8 +637,6 @@ impl SstImporter {
         let start = Instant::now();
         let dst_name = format!("{}_{}", meta.get_name(), meta.get_range_offset());
 
-        // TODO: handle the resource leakage once the download failed.
-
         let promise = {
             let lock = self.file_locks.entry(dst_name);
             IMPORTER_APPLY_DURATION
@@ -652,7 +654,8 @@ impl SstImporter {
                     }
                     _ => panic!(concat!(
                         "using both read-to-memory and download-to-file is unacceptable for now.",
-                        "(If you think it is possible for now, please change this line to `return item.get.0.clone()`)",
+                        "(If you think it is possible in the future you are reading this, ",
+                        "please change this line to `return item.get.0.clone()`)",
                         "(Please also check the state transform is OK too.)"
                     )),
                 },
