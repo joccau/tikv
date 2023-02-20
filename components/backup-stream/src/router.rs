@@ -593,12 +593,12 @@ impl RouterInner {
     /// tick aims to flush log/meta to extern storage periodically.
     pub async fn tick(&self) {
         for (name, task_info) in self.tasks.lock().await.iter() {
-            if let Err(e) = self
-                .scheduler
-                .schedule(Task::UpdateGlobalCheckpoint(name.to_string()))
-            {
-                error!("backup stream schedule task failed"; "error" => ?e);
-            }
+            // if let Err(e) = self
+            //     .scheduler
+            //     .schedule(Task::UpdateGlobalCheckpoint(name.to_string()))
+            // {
+            //     error!("backup stream schedule task failed"; "error" => ?e);
+            // }
 
             // if stream task need flush this time, schedule Task::Flush, or update time
             // justly.
